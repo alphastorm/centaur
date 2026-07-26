@@ -27,7 +27,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, HarnessType, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime,
@@ -632,6 +632,13 @@ async fn create_or_get_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    if request.harness_type == HarnessType::Omp {
+        enforce_omp_rollout(
+            thread_key.as_ref(),
+            env::var("CENTAUR_OMP_ENABLED").as_deref() == Ok("1"),
+            env::var("CENTAUR_OMP_THREAD_ALLOWLIST").ok().as_deref(),
+        )?;
+    }
     let harness_type = request.harness_type;
     let runtime = state.runtime()?;
     let on_harness_conflict = match request.on_harness_conflict {
@@ -652,6 +659,30 @@ async fn create_or_get_session(
         harness_switched: outcome.harness_switched,
         unavailable_requested_persona_id: outcome.unavailable_requested_persona_id,
     }))
+}
+
+fn enforce_omp_rollout(
+    thread_key: &str,
+    enabled: bool,
+    allowlist: Option<&str>,
+) -> Result<(), ApiError> {
+    if !enabled {
+        return Err(ApiError::Forbidden(
+            "OMP harness rollout is disabled".to_owned(),
+        ));
+    }
+    let allowed = allowlist.is_some_and(|entries| {
+        entries
+            .split(',')
+            .map(str::trim)
+            .any(|entry| !entry.is_empty() && entry == thread_key)
+    });
+    if !allowed {
+        return Err(ApiError::Forbidden(
+            "thread is not allowlisted for the OMP harness".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn get_session_context(
@@ -4742,5 +4773,27 @@ mod webhook_tests {
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Internal(_)));
+    }
+}
+
+#[cfg(test)]
+mod omp_rollout_tests {
+    use super::*;
+
+    #[test]
+    fn omp_rollout_requires_feature_flag_and_exact_thread_allowlist() {
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", false, Some("slack:C1:1.0")),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", true, None),
+            Err(ApiError::Forbidden(_))
+        ));
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", true, Some("slack:C1:1.00")),
+            Err(ApiError::Forbidden(_))
+        ));
+        enforce_omp_rollout("slack:C1:1.0", true, Some("slack:C2:2.0, slack:C1:1.0")).unwrap();
     }
 }

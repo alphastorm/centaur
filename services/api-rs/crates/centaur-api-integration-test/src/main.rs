@@ -19,6 +19,7 @@ use uuid::Uuid;
 const DEFAULT_API_URL: &str = "http://127.0.0.1:18080";
 const SOURCE_PATH: &str = "services/api-rs/crates/centaur-api-integration-test/src/main.rs";
 const TEST_MODEL: &str = "gpt-api-integration-test";
+const OMP_TEST_THREAD_KEY: &str = "api-integration-test:omp:harness-omp";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -249,6 +250,7 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
         (HarnessType::ClaudeCode, "claudecode"),
         (HarnessType::Nanocodex, "nanocodex"),
         (HarnessType::Hermes, "hermes"),
+        (HarnessType::Omp, "omp"),
     ];
 
     for (harness_type, expected_wire_value) in cases {
@@ -265,7 +267,11 @@ async fn test_harness_wire_values(http: &HttpClient, base_url: &str) -> Result<(
             );
         }
 
-        let thread_key = test_thread_key(format!("harness-{wire_value}"))?;
+        let thread_key = if harness_type == HarnessType::Omp {
+            OMP_TEST_THREAD_KEY.to_owned()
+        } else {
+            test_thread_key(format!("harness-{wire_value}"))?
+        };
         let session = post_json_ok(
             http,
             session_url(base_url, &thread_key),

@@ -1137,6 +1137,11 @@ impl SandboxArgs {
         {
             envs.push(("CLAUDE_CODE_AUTH_MODE".to_owned(), mode));
         }
+        for name in ["CENTAUR_OMP_ENABLED", "CENTAUR_OMP_ALLOWED_MODELS"] {
+            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref()) {
+                envs.push((name.to_owned(), value));
+            }
+        }
 
         // Inject the infra/harness placeholder credentials so env-based
         // consumers send the proxy_value iron-proxy replaces with the real
@@ -2180,6 +2185,7 @@ fn harness_fragment_engine_name(engine: &HarnessType) -> &'static str {
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Nanocodex => "codex",
         HarnessType::Hermes => "hermes",
+        HarnessType::Omp => "claude-code",
     }
 }
 
@@ -2200,6 +2206,7 @@ fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
         // Hermes resolves providers through its own credential store /
         // iron-proxy placeholder injection; no dedicated auth-mode env.
         HarnessType::Hermes => None,
+        HarnessType::Omp => env::var("OMP_AUTH_MODE").ok(),
     }
 }
 
@@ -3575,6 +3582,20 @@ mod tests {
         assert_eq!(
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
+        );
+
+        let omp_args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--kubernetes-iron-proxy-harness-engine",
+            "omp",
+        ])
+        .unwrap();
+        assert_eq!(omp_args.sandbox.iron_proxy.harness.engine, HarnessType::Omp);
+        assert_eq!(
+            harness_fragment_engine_name(&HarnessType::Omp),
+            "claude-code"
         );
     }
 

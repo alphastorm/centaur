@@ -232,6 +232,8 @@ jobs:
           CENTAUR_CONSOLE_INITIAL_USER_PASSWORD: api-integration-password
           CENTAUR_API_URL: http://127.0.0.1:18080
           CENTAUR_JWT_SIGNING_SECRET: api-integration-jwt-signing-secret
+          CENTAUR_OMP_ENABLED: "1"
+          CENTAUR_OMP_THREAD_ALLOWLIST: api-integration-test:omp:harness-omp
           DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/centaur?sslmode=disable
           IRON_CONTROL_API_KEY: iak_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           IRON_CONTROL_URL: http://127.0.0.1:18081
