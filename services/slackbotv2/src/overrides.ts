@@ -57,7 +57,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   claudecode: 'claudecode',
   codex: 'codex',
   hermes: 'hermes',
-  nanocodex: 'nanocodex'
+  nanocodex: 'nanocodex',
+  omp: 'omp'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -87,7 +88,7 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
     ])
   )
 
-const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex'])
+const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'omp'])
 const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
@@ -252,14 +253,14 @@ export function validateStrategyOverrides(
   const harnessRaw = cleanString(raw.harness)
   if (harnessRaw) {
     const normalized = harnessRaw.toLowerCase()
-    if (!STRATEGY_HARNESSES.has(normalized)) return {}
+    if (!STRATEGY_HARNESSES[normalized]) return {}
     harnessType = normalized
   }
 
   const providerRaw = cleanString(raw.provider)
   if (providerRaw) {
     const normalized = providerRaw.toLowerCase()
-    if (!STRATEGY_PROVIDERS.has(normalized)) return {}
+    if (!STRATEGY_PROVIDERS[normalized]) return {}
     provider = normalized
     if (harnessType && harnessType !== 'codex') return {}
     harnessType = 'codex'
