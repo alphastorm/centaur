@@ -112,9 +112,9 @@ thread to another harness follows Centaur's normal restart policy.
 The rollout flag and exact thread allowlist are admission gates at the shared
 session runtime boundary: HTTP creation, harness switches, workflow
 `ctx.agent_turn` overrides, and tool-host session creation all use the same
-check. Create-or-get first loads the durable session: an existing OMP session
-still loads when admission is disabled, while a new OMP session or a switch
-into OMP is refused. Disabling admission does not
+check. When that check would refuse OMP, the runtime consults the durable
+session: an existing OMP session still loads when admission is disabled, while a
+new OMP session or a switch into OMP is refused. Disabling admission does not
 terminate an existing OMP execution or prevent an already admitted session from
 executing again. Direct operator invocation of `harness-server omp` is not
 control-plane session creation; its local profile still requires enablement

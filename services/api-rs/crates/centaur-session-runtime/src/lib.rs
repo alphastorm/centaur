@@ -1406,13 +1406,8 @@ impl SessionRuntime {
             .warm_harness
             .clone()
             .unwrap_or(HarnessType::Codex);
-        match self.store.get_session(thread_key).await {
-            Ok(_) => {}
-            Err(SessionStoreError::NotFound { .. }) => {
-                enforce_harness_rollout(thread_key, &harness)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        self.enforce_new_session_rollout(thread_key, &harness)
+            .await?;
         let metadata =
             tool_host_session_metadata(principal_id, console_user_email, console_user_name);
         let session = self
@@ -1774,6 +1769,26 @@ impl SessionRuntime {
         .await
     }
 
+    /// Applies the harness rollout gate to session admission only. The durable
+    /// store is consulted only after the gate denies, so an existing session
+    /// keeps working when its rollout is later disabled, and other harnesses
+    /// see no additional store access. Switching an existing session onto a
+    /// gated harness is checked where the restart happens.
+    async fn enforce_new_session_rollout(
+        &self,
+        thread_key: &ThreadKey,
+        harness: &HarnessType,
+    ) -> Result<(), SessionRuntimeError> {
+        let Err(denied) = enforce_harness_rollout(thread_key, harness) else {
+            return Ok(());
+        };
+        match self.store.get_session(thread_key).await {
+            Ok(_) => Ok(()),
+            Err(SessionStoreError::NotFound { .. }) => Err(denied),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn create_or_get_session_with_principal_admission(
         &self,
@@ -1785,6 +1800,8 @@ impl SessionRuntime {
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        self.enforce_new_session_rollout(thread_key, harness_type)
+            .await?;
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
                 return Err(SessionRuntimeError::BadRequest(
@@ -1811,14 +1828,6 @@ impl SessionRuntime {
                 harness_type = %harness_type,
                 "creating or loading session"
             );
-            let existing_session = match self.store.get_session(thread_key).await {
-                Ok(session) => Some(session),
-                Err(SessionStoreError::NotFound { .. }) => {
-                    enforce_harness_rollout(thread_key, harness_type)?;
-                    None
-                }
-                Err(error) => return Err(error.into()),
-            };
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
@@ -1839,10 +1848,15 @@ impl SessionRuntime {
             // Use the stored persona before the requested one so later persona
             // flags cannot change or invalidate an existing thread. Its
             // context is resolved once from the post-create session below.
-            let persona_resolution = match existing_session {
-                Some(session) => PersonaResolution {
+            let existing_persona_id = match self.store.get_session(thread_key).await {
+                Ok(session) => Some(session.persona_id),
+                Err(SessionStoreError::NotFound { .. }) => None,
+                Err(error) => return Err(error.into()),
+            };
+            let persona_resolution = match existing_persona_id {
+                Some(persona_id) => PersonaResolution {
                     context: None,
-                    persona_id: session.persona_id,
+                    persona_id,
                     unavailable_requested_persona_id: None,
                 },
                 None => resolve_persona_selection(
@@ -9362,6 +9376,42 @@ mod adoption_tests {
     #[derive(Clone, Copy)]
     struct TestSessionPrincipalRegistrar;
 
+    #[derive(Clone, Copy)]
+    struct AdmissionProbeRegistrar;
+
+    #[async_trait::async_trait]
+    impl SessionPrincipalRegistrar for AdmissionProbeRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            create_if_missing: bool,
+        ) -> Result<Principal, IronControlError> {
+            if create_if_missing {
+                Err(IronControlError::PrincipalDerivation(
+                    centaur_iron_control::PrincipalDerivationError::MissingSlackTeamId,
+                ))
+            } else {
+                Err(IronControlError::SessionPrincipalNotPreapproved {
+                    foreign_id: "slack-channel-t123-c123".to_owned(),
+                })
+            }
+        }
+
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Option<Principal>, IronControlError> {
+            Ok(None)
+        }
+
+        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
+            Ok(test_principal(principal))
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
         async fn register_session(
@@ -9395,6 +9445,72 @@ mod adoption_tests {
             labels: BTreeMap::new(),
             sandbox_observability_enabled: true,
         }
+    }
+
+    #[tokio::test]
+    async fn preapproved_admission_disables_principal_creation_before_store_access() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_admitted_session(
+                &ThreadKey::try_from("slack:T123:C123:1773364194.179929".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(
+                IronControlError::SessionPrincipalNotPreapproved { .. }
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_sessions_keep_automatic_principal_creation() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
+                .expect("create lazy pool");
+        let runtime = SessionRuntime::new(
+            PgSessionStore::new(pool),
+            SandboxRuntime::backend(
+                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                SandboxSpec::new("test"),
+            ),
+            AdmissionProbeRegistrar,
+        )
+        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
+
+        let error = runtime
+            .create_or_get_session(
+                &ThreadKey::try_from("workflow:internal:test".to_owned()).unwrap(),
+                &HarnessType::Codex,
+                None,
+                None,
+                HarnessConflictPolicy::Reject,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionRuntimeError::IronControl(IronControlError::PrincipalDerivation(_))
+        ));
     }
 
     type ProxyEnsure = (String, String, Option<String>, BTreeMap<String, String>);
