@@ -1,12 +1,12 @@
 use serde_json::Value;
 
 use crate::Result;
-use crate::omp::protocol::{frame_type, protocol_error};
+use crate::omp::protocol::{frame_type, is_state_notification, protocol_error};
 use crate::traits::{
     NormalizedContent, NormalizedEvent, NormalizedTokenUsage, NormalizedToolResult,
 };
 
-const MAX_RENDERED_TEXT_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_RENDERED_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct OmpEventNormalizer {
@@ -58,7 +58,12 @@ impl OmpEventNormalizer {
                             });
                         }
                     }
-                    _ => {}
+                    Some(
+                        "start" | "text_start" | "text_end" | "thinking_start" | "thinking_end"
+                        | "image_end" | "toolcall_start" | "toolcall_delta" | "toolcall_end"
+                        | "done" | "error",
+                    ) => {}
+                    _ => return Err(protocol_error("unknown OMP assistant message update")),
                 }
             }
             "message_end" => {
@@ -117,26 +122,7 @@ impl OmpEventNormalizer {
                 }]));
             }
             "command_output" => {
-                let output = frame
-                    .get("output")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if !output.is_empty() {
-                    self.command_output_index += 1;
-                    let item_id = format!("omp-command-output-{}", self.command_output_index);
-                    events.push(NormalizedEvent::AgentMessageStarted {
-                        item_id: item_id.clone(),
-                        stop_reason: Some("end_turn".to_string()),
-                    });
-                    events.push(NormalizedEvent::AssistantMessage {
-                        partial: false,
-                        stop_reason: Some("end_turn".to_string()),
-                        content: vec![NormalizedContent::AgentText {
-                            item_id,
-                            text: bounded_text(output),
-                        }],
-                    });
-                }
+                events = self.command_output(required_frame_string(frame, "text")?, false);
             }
             "notice" => {
                 if frame.get("level").and_then(Value::as_str) == Some("error") {
@@ -166,9 +152,68 @@ impl OmpEventNormalizer {
                     .unwrap_or_else(|| "OMP extension error".to_string());
                 events.push(NormalizedEvent::Error { message });
             }
-            _ => events.push(NormalizedEvent::Ignored),
+            "tool_stream_update"
+            | "auto_compaction_start"
+            | "auto_compaction_end"
+            | "auto_retry_start"
+            | "retry_fallback_applied"
+            | "retry_fallback_succeeded"
+            | "ttsr_triggered"
+            | "todo_reminder"
+            | "todo_auto_clear"
+            | "irc_message"
+            | "goal_updated"
+            | "advisor_yielded" => {}
+            _ if is_state_notification(kind) => {}
+            _ => return Err(protocol_error(format!("unknown OMP event kind {kind}"))),
         }
         Ok(events)
+    }
+
+    pub(crate) fn command_output(
+        &mut self,
+        output: &str,
+        local_only: bool,
+    ) -> Vec<NormalizedEvent> {
+        if output.is_empty() {
+            return Vec::new();
+        }
+        self.command_output_index += 1;
+        let item_id = format!("omp-command-output-{}", self.command_output_index);
+        if local_only {
+            vec![
+                NormalizedEvent::AgentMessageStarted {
+                    item_id: item_id.clone(),
+                    stop_reason: Some("end_turn".to_string()),
+                },
+                NormalizedEvent::AssistantMessage {
+                    partial: false,
+                    stop_reason: Some("end_turn".to_string()),
+                    content: vec![NormalizedContent::AgentText {
+                        item_id,
+                        text: bounded_text(output),
+                    }],
+                },
+            ]
+        } else {
+            vec![
+                NormalizedEvent::AssistantMessage {
+                    partial: false,
+                    stop_reason: Some("tool_use".to_string()),
+                    content: vec![NormalizedContent::ToolUse {
+                        raw_id: item_id.clone(),
+                        tool: "omp_command".to_string(),
+                        arguments: Value::Null,
+                    }],
+                },
+                NormalizedEvent::ToolResults(vec![NormalizedToolResult {
+                    tool_use_id: item_id,
+                    content: bounded_text(output),
+                    is_error: false,
+                    exit_code: None,
+                }]),
+            ]
+        }
     }
 }
 

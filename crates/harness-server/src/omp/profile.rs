@@ -29,17 +29,6 @@ const APPROVED_ENV: &[&str] = &[
     "NO_PROXY",
     "NODE_EXTRA_CA_CERTS",
     "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_PROFILE",
-    "GOOGLE_CLOUD_PROJECT",
-    "GOOGLE_CLOUD_LOCATION",
-    "GOOGLE_APPLICATION_CREDENTIALS",
 ];
 
 #[derive(Debug, Clone)]
@@ -50,6 +39,16 @@ pub(crate) struct OmpProfile {
 }
 
 impl OmpProfile {
+    #[cfg(test)]
+    pub(crate) fn for_test(binary: PathBuf, root: &Path) -> Self {
+        fs::create_dir_all(root.join("mappings")).unwrap();
+        Self {
+            binary,
+            allowed_models: BTreeSet::from([("anthropic".into(), "fake-model".into())]),
+            session_root: root.canonicalize().unwrap(),
+        }
+    }
+
     pub(crate) fn load() -> Result<Self> {
         if env::var("CENTAUR_OMP_ENABLED").as_deref() != Ok("1") {
             return Err(protocol_error(
@@ -82,16 +81,12 @@ impl OmpProfile {
         if !session_root.is_absolute() {
             return Err(protocol_error("OMP session root must be absolute"));
         }
-        if let Ok(metadata) = fs::symlink_metadata(&session_root)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(protocol_error("OMP session root may not be a symlink"));
-        }
         fs::create_dir_all(&session_root)?;
+        let session_root = session_root.canonicalize()?;
         #[cfg(unix)]
         fs::set_permissions(&session_root, fs::Permissions::from_mode(0o700))?;
-        let session_root = session_root.canonicalize()?;
         let mappings = session_root.join("mappings");
+        validate_contained_session_path(&session_root, &mappings)?;
         fs::create_dir_all(&mappings)?;
         #[cfg(unix)]
         fs::set_permissions(&mappings, fs::Permissions::from_mode(0o700))?;
@@ -198,49 +193,64 @@ pub(crate) fn validate_contained_session_path(root: &Path, path: &Path) -> Resul
     if !path.is_absolute() {
         return Err(protocol_error("OMP session path must be absolute"));
     }
-    let normalized = normalize_without_symlinks(path)?;
-    if !normalized.starts_with(root) {
-        return Err(protocol_error(
-            "OMP session path escapes the operator session root",
-        ));
-    }
-    if path.exists() {
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(root) {
-            return Err(protocol_error(
-                "OMP session path resolves outside the operator session root",
-            ));
+    let relative = if let Ok(relative) = path.strip_prefix(root) {
+        relative
+    } else {
+        // The entrypoint may relocate ~/.omp with a symlink. Permit that
+        // spelling only up to the first ancestor resolving to the configured
+        // canonical root; symlinks below that boundary remain forbidden.
+        let mut prefix = PathBuf::new();
+        let mut remaining = path.components();
+        loop {
+            let component = remaining.next().ok_or_else(|| {
+                protocol_error("OMP session path escapes the operator session root")
+            })?;
+            prefix.push(component);
+            if prefix.canonicalize()? == root {
+                break remaining.as_path();
+            }
         }
-        return Ok(canonical);
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| protocol_error("OMP session path has no parent"))?;
-    let canonical_parent = parent.canonicalize()?;
-    if !canonical_parent.starts_with(root) {
-        return Err(protocol_error(
-            "OMP session parent resolves outside the operator session root",
-        ));
-    }
-    Ok(path.to_path_buf())
-}
-
-fn normalize_without_symlinks(path: &Path) -> Result<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
+    };
+    let mut resolved = root.to_path_buf();
+    for component in relative.components() {
         match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(Path::new("/")),
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !normalized.pop() {
+                if resolved == root {
                     return Err(protocol_error("OMP session path escapes its root"));
                 }
+                resolved.pop();
             }
-            std::path::Component::Normal(value) => normalized.push(value),
+            std::path::Component::Normal(value) => {
+                resolved.push(value);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(protocol_error(
+                            "OMP session path inside the root may not be a symlink",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            _ => return Err(protocol_error("OMP session path escapes its root")),
         }
     }
-    Ok(normalized)
+    let canonical = if resolved.exists() {
+        resolved.canonicalize()?
+    } else {
+        let parent = resolved
+            .parent()
+            .ok_or_else(|| protocol_error("OMP session path has no parent"))?;
+        parent.canonicalize()?.join(resolved.file_name().unwrap())
+    };
+    if !canonical.starts_with(root) {
+        return Err(protocol_error(
+            "OMP session path resolves outside the operator session root",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn parse_allowed_models() -> Result<BTreeSet<(String, String)>> {
@@ -322,6 +332,30 @@ mod tests {
     use std::fs;
 
     use super::{parse_allowed_model_list, validate_contained_session_path};
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_entrypoint_state_root_alias_but_rejects_inner_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let parent =
+            std::env::temp_dir().join(format!("omp-state-volume-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("state/omp/centaur-sessions");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(parent.join("home")).unwrap();
+        symlink(parent.join("state/omp"), parent.join("home/.omp")).unwrap();
+        let root = root.canonicalize().unwrap();
+        fs::write(root.join("session.jsonl"), b"{}").unwrap();
+        let alias = parent.join("home/.omp/centaur-sessions");
+        let existing = validate_contained_session_path(&root, &alias.join("session.jsonl"));
+        let new_file = validate_contained_session_path(&root, &alias.join("new.jsonl"));
+        symlink(root.join("session.jsonl"), root.join("inner.jsonl")).unwrap();
+        let inner = validate_contained_session_path(&root, &alias.join("inner.jsonl"));
+        fs::remove_dir_all(parent).unwrap();
+        assert_eq!(existing.unwrap(), root.join("session.jsonl"));
+        assert_eq!(new_file.unwrap(), root.join("new.jsonl"));
+        assert!(inner.is_err());
+    }
 
     #[test]
     fn rejects_session_path_escape() {

@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
-use crate::omp::normalize::OmpEventNormalizer;
+use crate::omp::normalize::{MAX_RENDERED_TEXT_BYTES, OmpEventNormalizer};
 use crate::omp::persistence::{self, SessionMapping};
 use crate::omp::profile::{OmpProfile, validate_contained_session_path};
 use crate::omp::protocol::{
@@ -111,9 +111,13 @@ impl OmpSession {
         let started = Instant::now();
         let mut last_progress = started;
         let mut prompt_acknowledged = false;
+        let mut agent_started = false;
         let mut terminal_seen = false;
+        let mut terminal_check: Option<(String, Instant)> = None;
         let mut interrupted = false;
         let mut abort_deadline = None;
+        let mut turn_error = None;
+        let mut pending_command_output = String::new();
         let mut usage = None;
 
         loop {
@@ -146,8 +150,18 @@ impl OmpSession {
                 }
             }
 
+            if terminal_seen && (prompt_acknowledged || interrupted) {
+                if let Some(error) = turn_error {
+                    return Err(protocol_error(error));
+                }
+                emit(NormalizedEvent::Result { error: None })?;
+                return Ok(TurnOutcome { interrupted, usage });
+            }
             if interrupted && abort_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = self.process.kill_and_wait();
+                if let Some(error) = turn_error {
+                    return Err(protocol_error(error));
+                }
                 return Ok(TurnOutcome {
                     interrupted: true,
                     usage,
@@ -155,6 +169,12 @@ impl OmpSession {
             }
             if !prompt_acknowledged && started.elapsed() >= COMMAND_TIMEOUT {
                 return Err(protocol_error("OMP prompt acknowledgement timed out"));
+            }
+            if terminal_check
+                .as_ref()
+                .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+            {
+                return Err(protocol_error("OMP terminal state check timed out"));
             }
             if last_progress.elapsed() >= TURN_IDLE_TIMEOUT {
                 return Err(protocol_error(
@@ -170,7 +190,6 @@ impl OmpSession {
                 }
                 Err(error) => return Err(error),
             };
-            last_progress = Instant::now();
             let kind = frame_type(&frame)?;
 
             if kind == "response" {
@@ -203,12 +222,38 @@ impl OmpSession {
                         .and_then(Value::as_bool)
                         == Some(false)
                     {
-                        emit(NormalizedEvent::Result { error: None })?;
-                        return Ok(TurnOutcome { interrupted, usage });
+                        for event in self
+                            .normalizer
+                            .command_output(&pending_command_output, true)
+                        {
+                            emit(event)?;
+                        }
+                        pending_command_output.clear();
+                        terminal_seen = true;
                     }
+                    last_progress = Instant::now();
+                    continue;
+                }
+                if terminal_check
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == id)
+                {
+                    if command != "get_state" || !success {
+                        return Err(protocol_error(
+                            "OMP terminal state check failed or mismatched",
+                        ));
+                    }
+                    let streaming = frame
+                        .pointer("/data/isStreaming")
+                        .and_then(Value::as_bool)
+                        .ok_or_else(|| protocol_error("OMP terminal state omitted isStreaming"))?;
+                    terminal_check = None;
+                    // OMP 18.3 terminals carry no prompt ID. A response issued
+                    // for this prompt confirms quiescence; a stale terminal
+                    // while the current agent is streaming cannot settle it.
+                    terminal_seen = !streaming;
                     if terminal_seen {
-                        emit(NormalizedEvent::Result { error: None })?;
-                        return Ok(TurnOutcome { interrupted, usage });
+                        last_progress = Instant::now();
                     }
                     continue;
                 }
@@ -225,6 +270,9 @@ impl OmpSession {
                         "OMP {expected} response failed or mismatched"
                     )));
                 }
+                if issued_turn == turn_sequence {
+                    last_progress = Instant::now();
+                }
                 continue;
             }
 
@@ -232,39 +280,90 @@ impl OmpSession {
                 if frame.get("id").and_then(Value::as_str) == Some(prompt_id.as_str())
                     && frame.get("agentInvoked").and_then(Value::as_bool) == Some(false)
                 {
-                    emit(NormalizedEvent::Result { error: None })?;
-                    return Ok(TurnOutcome { interrupted, usage });
+                    for event in self
+                        .normalizer
+                        .command_output(&pending_command_output, true)
+                    {
+                        emit(event)?;
+                    }
+                    pending_command_output.clear();
+                    terminal_seen = true;
+                    last_progress = Instant::now();
                 }
                 continue;
             }
 
             if is_privileged_callback(kind) {
                 self.deny_callback(&frame)?;
+                last_progress = Instant::now();
                 continue;
             }
 
-            if kind == "agent_end"
-                && frame.get("isTerminal").and_then(Value::as_bool) != Some(false)
-            {
-                terminal_seen = true;
-                if interrupted {
-                    return Ok(TurnOutcome {
-                        interrupted: true,
-                        usage,
-                    });
+            if kind == "agent_end" {
+                let terminal = frame
+                    .get("isTerminal")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| protocol_error("OMP agent_end omitted boolean isTerminal"))?;
+                if !agent_started {
+                    // Consume late terminals from the previous prompt.
+                    continue;
                 }
-                if prompt_acknowledged {
-                    emit(NormalizedEvent::Result { error: None })?;
-                    return Ok(TurnOutcome { interrupted, usage });
+                if terminal && terminal_check.is_none() {
+                    let id = self.command_id("get_state");
+                    self.process
+                        .write_json(&json!({"id": id, "type": "get_state"}))?;
+                    terminal_check = Some((id, Instant::now() + COMMAND_TIMEOUT));
+                } else if !terminal {
+                    last_progress = Instant::now();
                 }
+                continue;
+            }
+
+            if kind == "agent_start" {
+                agent_started = true;
+                for event in self
+                    .normalizer
+                    .command_output(&pending_command_output, false)
+                {
+                    emit(event)?;
+                }
+                pending_command_output.clear();
+            }
+            if kind == "command_output" && !agent_started {
+                let text = frame
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| protocol_error("OMP command_output omitted text"))?;
+                if pending_command_output.len().saturating_add(text.len()) > MAX_RENDERED_TEXT_BYTES
+                {
+                    return Err(protocol_error(
+                        "OMP pending command output exceeds its size limit",
+                    ));
+                }
+                pending_command_output.push_str(text);
+                last_progress = Instant::now();
+                continue;
             }
 
             for event in self.normalizer.normalize(&frame)? {
                 if let NormalizedEvent::TokenUsage { usage: event_usage } = &event {
                     usage = Some(event_usage.clone());
                 }
+                if let NormalizedEvent::Error { message } = event {
+                    turn_error.get_or_insert(message);
+                    if !interrupted {
+                        interrupted = true;
+                        let id = self.command_id("abort");
+                        self.process
+                            .write_json(&json!({"id": id, "type": "abort"}))?;
+                        self.pending_controls.insert(id, ("abort", turn_sequence));
+                        abort_deadline = Some(Instant::now() + ABORT_GRACE);
+                    }
+                    continue;
+                }
                 emit(event)?;
             }
+            last_progress = Instant::now();
         }
     }
 
@@ -350,7 +449,7 @@ impl OmpSession {
         requested_model: &str,
         resume: Option<&SessionMapping>,
     ) -> Result<()> {
-        let ready_value = self.recv_required_frame(STARTUP_TIMEOUT)?;
+        let ready_value = self.recv_required_frame(Instant::now() + STARTUP_TIMEOUT)?;
         let ready = parse_ready(&ready_value)?;
         self.decoder.set_limits_from_ready(&ready);
         if ready.supported_protocol_versions.contains(&2) {
@@ -470,11 +569,7 @@ impl OmpSession {
         self.process.write_json(&Value::Object(value))?;
         let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(protocol_error(format!("OMP {command} response timed out")));
-            }
-            let frame = self.recv_required_frame(remaining)?;
+            let frame = self.recv_required_frame(deadline)?;
             let kind = frame_type(&frame)?;
             if kind == "response" {
                 let response_id = frame.get("id").and_then(Value::as_str);
@@ -508,6 +603,12 @@ impl OmpSession {
             }
             if is_privileged_callback(kind) {
                 self.deny_callback(&frame)?;
+                continue;
+            }
+            if kind == "agent_end" {
+                if frame.get("isTerminal").and_then(Value::as_bool).is_none() {
+                    return Err(protocol_error("OMP agent_end omitted boolean isTerminal"));
+                }
                 continue;
             }
             if !is_state_notification(kind) {
@@ -569,9 +670,13 @@ impl OmpSession {
         self.process.write_json(&response)
     }
 
-    fn recv_required_frame(&mut self, timeout: Duration) -> Result<Value> {
+    fn recv_required_frame(&mut self, deadline: Instant) -> Result<Value> {
         loop {
-            match self.recv_frame(timeout)? {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(protocol_error("OMP frame wait timed out"));
+            }
+            match self.recv_frame(remaining)? {
                 Some(frame) => return Ok(frame),
                 None => continue,
             }
@@ -753,4 +858,40 @@ fn bounded_error(error: Option<&str>) -> String {
         end -= 1;
     }
     format!("{} [truncated]", &error[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_chunked_command_response_obeys_one_deadline() {
+        let root = std::env::temp_dir().join(format!("omp-command-{}", uuid::Uuid::new_v4()));
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_omp_rpc.py");
+        let profile = OmpProfile::for_test(fixture, &root);
+        let mut session = OmpSession::start(
+            profile,
+            "deadline-test",
+            &root,
+            "anthropic",
+            "fake-model",
+            None,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let result = session.send_command_wait(
+            "get_state",
+            json!({"slowChunks": true}),
+            Duration::from_millis(200),
+        );
+        let elapsed = started.elapsed();
+        drop(session);
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.is_err(),
+            "slow chunks exceeded deadline but returned success"
+        );
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+    }
 }

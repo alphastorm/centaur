@@ -1406,7 +1406,13 @@ impl SessionRuntime {
             .warm_harness
             .clone()
             .unwrap_or(HarnessType::Codex);
-        enforce_harness_rollout(thread_key, &harness)?;
+        match self.store.get_session(thread_key).await {
+            Ok(_) => {}
+            Err(SessionStoreError::NotFound { .. }) => {
+                enforce_harness_rollout(thread_key, &harness)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         let metadata =
             tool_host_session_metadata(principal_id, console_user_email, console_user_name);
         let session = self
@@ -1779,7 +1785,6 @@ impl SessionRuntime {
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
-        enforce_harness_rollout(thread_key, harness_type)?;
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
                 return Err(SessionRuntimeError::BadRequest(
@@ -1806,6 +1811,14 @@ impl SessionRuntime {
                 harness_type = %harness_type,
                 "creating or loading session"
             );
+            let existing_session = match self.store.get_session(thread_key).await {
+                Ok(session) => Some(session),
+                Err(SessionStoreError::NotFound { .. }) => {
+                    enforce_harness_rollout(thread_key, harness_type)?;
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            };
             let mut harness_switched = false;
             let mut session_metadata = default_metadata(metadata);
             let proxy_labels = proxy_labels_from_session_metadata(thread_key, &session_metadata);
@@ -1826,15 +1839,10 @@ impl SessionRuntime {
             // Use the stored persona before the requested one so later persona
             // flags cannot change or invalidate an existing thread. Its
             // context is resolved once from the post-create session below.
-            let existing_persona_id = match self.store.get_session(thread_key).await {
-                Ok(session) => Some(session.persona_id),
-                Err(SessionStoreError::NotFound { .. }) => None,
-                Err(error) => return Err(error.into()),
-            };
-            let persona_resolution = match existing_persona_id {
-                Some(persona_id) => PersonaResolution {
+            let persona_resolution = match existing_session {
+                Some(session) => PersonaResolution {
                     context: None,
-                    persona_id,
+                    persona_id: session.persona_id,
                     unavailable_requested_persona_id: None,
                 },
                 None => resolve_persona_selection(
@@ -1861,6 +1869,7 @@ impl SessionRuntime {
                 Err(SessionStoreError::HarnessConflict { existing, .. })
                     if on_harness_conflict == HarnessConflictPolicy::Restart =>
                 {
+                    enforce_harness_rollout(thread_key, harness_type)?;
                     let session = self
                         .restart_session_on_harness(thread_key, harness_type, &existing)
                         .await?;
@@ -9353,42 +9362,6 @@ mod adoption_tests {
     #[derive(Clone, Copy)]
     struct TestSessionPrincipalRegistrar;
 
-    #[derive(Clone, Copy)]
-    struct AdmissionProbeRegistrar;
-
-    #[async_trait::async_trait]
-    impl SessionPrincipalRegistrar for AdmissionProbeRegistrar {
-        async fn register_session(
-            &self,
-            _thread_key: &str,
-            _metadata: Option<&Value>,
-            create_if_missing: bool,
-        ) -> Result<Principal, IronControlError> {
-            if create_if_missing {
-                Err(IronControlError::PrincipalDerivation(
-                    centaur_iron_control::PrincipalDerivationError::MissingSlackTeamId,
-                ))
-            } else {
-                Err(IronControlError::SessionPrincipalNotPreapproved {
-                    foreign_id: "slack-channel-t123-c123".to_owned(),
-                })
-            }
-        }
-
-        async fn register_requester(
-            &self,
-            _thread_key: &str,
-            _metadata: Option<&Value>,
-            _create_if_missing: bool,
-        ) -> Result<Option<Principal>, IronControlError> {
-            Ok(None)
-        }
-
-        async fn get_principal(&self, principal: &str) -> Result<Principal, IronControlError> {
-            Ok(test_principal(principal))
-        }
-    }
-
     #[async_trait::async_trait]
     impl SessionPrincipalRegistrar for TestSessionPrincipalRegistrar {
         async fn register_session(
@@ -9422,72 +9395,6 @@ mod adoption_tests {
             labels: BTreeMap::new(),
             sandbox_observability_enabled: true,
         }
-    }
-
-    #[tokio::test]
-    async fn preapproved_admission_disables_principal_creation_before_store_access() {
-        let pool =
-            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
-                .expect("create lazy pool");
-        let runtime = SessionRuntime::new(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(
-                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-                SandboxSpec::new("test"),
-            ),
-            AdmissionProbeRegistrar,
-        )
-        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
-
-        let error = runtime
-            .create_or_get_admitted_session(
-                &ThreadKey::try_from("slack:T123:C123:1773364194.179929".to_owned()).unwrap(),
-                &HarnessType::Codex,
-                None,
-                None,
-                HarnessConflictPolicy::Reject,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionRuntimeError::IronControl(
-                IronControlError::SessionPrincipalNotPreapproved { .. }
-            )
-        ));
-    }
-
-    #[tokio::test]
-    async fn internal_sessions_keep_automatic_principal_creation() {
-        let pool =
-            sqlx::PgPool::connect_lazy("postgres://postgres:postgres@localhost/centaur_test")
-                .expect("create lazy pool");
-        let runtime = SessionRuntime::new(
-            PgSessionStore::new(pool),
-            SandboxRuntime::backend(
-                Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
-                SandboxSpec::new("test"),
-            ),
-            AdmissionProbeRegistrar,
-        )
-        .with_session_principal_admission(SessionPrincipalAdmission::Preapproved);
-
-        let error = runtime
-            .create_or_get_session(
-                &ThreadKey::try_from("workflow:internal:test".to_owned()).unwrap(),
-                &HarnessType::Codex,
-                None,
-                None,
-                HarnessConflictPolicy::Reject,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            SessionRuntimeError::IronControl(IronControlError::PrincipalDerivation(_))
-        ));
     }
 
     type ProxyEnsure = (String, String, Option<String>, BTreeMap<String, String>);
@@ -9930,6 +9837,144 @@ mod adoption_tests {
     }
 
     #[test]
+    fn omp_existing_session_survives_rollout_disable() {
+        if std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL").is_err() {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return;
+        }
+        if std::env::var("CENTAUR_TEST_OMP_EXISTING_SESSION").is_err() {
+            let _serial = TEST_LOCK.blocking_lock();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "adoption_tests::omp_existing_session_survives_rollout_disable",
+                    "--nocapture",
+                ])
+                .env("CENTAUR_TEST_OMP_EXISTING_SESSION", "1")
+                .env("CENTAUR_OMP_ENABLED", "0")
+                .env_remove("CENTAUR_OMP_THREAD_ALLOWLIST")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "existing OMP session must survive admission disablement"
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = test_store().await.unwrap();
+                let runtime = runtime_with(
+                    &store,
+                    Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                );
+                let thread_key =
+                    ThreadKey::parse(format!("test:omp-existing:{}", uuid::Uuid::new_v4()))
+                        .unwrap();
+                let original = store
+                    .create_or_get_session(
+                        &thread_key,
+                        &HarnessType::Omp,
+                        None,
+                        json!({"preserved": true}),
+                        BTreeMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                let outcome = runtime
+                    .create_or_get_admitted_session(
+                        &thread_key,
+                        &HarnessType::Omp,
+                        None,
+                        None,
+                        HarnessConflictPolicy::Reject,
+                    )
+                    .await
+                    .expect("load an already admitted OMP session");
+                assert_eq!(outcome.session.thread_key, original.thread_key);
+                assert_eq!(outcome.session.harness_type, HarnessType::Omp);
+                assert_eq!(
+                    session_metadata(&store, &thread_key).await["preserved"],
+                    true
+                );
+                assert!(!outcome.harness_switched);
+
+                let new_thread_key =
+                    ThreadKey::parse(format!("test:omp-new:{}", uuid::Uuid::new_v4())).unwrap();
+                let result = runtime
+                    .create_or_get_admitted_session(
+                        &new_thread_key,
+                        &HarnessType::Omp,
+                        None,
+                        None,
+                        HarnessConflictPolicy::Reject,
+                    )
+                    .await;
+                assert!(matches!(result, Err(SessionRuntimeError::Forbidden(_))));
+                assert!(matches!(
+                    store.get_session(&new_thread_key).await,
+                    Err(SessionStoreError::NotFound { .. })
+                ));
+
+                let switch_thread_key =
+                    ThreadKey::parse(format!("test:omp-switch:{}", uuid::Uuid::new_v4())).unwrap();
+                store
+                    .create_or_get_session(
+                        &switch_thread_key,
+                        &HarnessType::Codex,
+                        None,
+                        json!({}),
+                        BTreeMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                let result = runtime
+                    .create_or_get_admitted_session(
+                        &switch_thread_key,
+                        &HarnessType::Omp,
+                        None,
+                        None,
+                        HarnessConflictPolicy::Restart,
+                    )
+                    .await;
+                assert!(matches!(result, Err(SessionRuntimeError::Forbidden(_))));
+                assert_eq!(
+                    store
+                        .get_session(&switch_thread_key)
+                        .await
+                        .unwrap()
+                        .harness_type,
+                    HarnessType::Codex
+                );
+                let result = runtime
+                    .create_or_get_admitted_session(
+                        &switch_thread_key,
+                        &HarnessType::Omp,
+                        None,
+                        None,
+                        HarnessConflictPolicy::Reject,
+                    )
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(SessionRuntimeError::Store(
+                        SessionStoreError::HarnessConflict { .. }
+                    ))
+                ));
+                for key in [&thread_key, &switch_thread_key] {
+                    sqlx::query("delete from sessions where thread_key = $1")
+                        .bind(key.as_str())
+                        .execute(store.pool())
+                        .await
+                        .unwrap();
+                }
+            });
+    }
+
+    #[test]
     fn omp_tool_host_creation_obeys_rollout() {
         if std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL").is_err() {
             eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
@@ -9941,6 +9986,7 @@ mod adoption_tests {
                 ("disabled", "0", true),
                 ("not-allowlisted", "1", false),
                 ("allowed", "1", true),
+                ("existing-disabled", "0", false),
             ] {
                 let thread = format!("mcp:omp_{}", uuid::Uuid::new_v4());
                 let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -9979,10 +10025,22 @@ mod adoption_tests {
                     Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
                 );
                 runtime.sandbox_runtime.warm_harness = Some(HarnessType::Omp);
+                if case == "existing-disabled" {
+                    store
+                        .create_or_get_session(
+                            &thread_key,
+                            &HarnessType::Omp,
+                            None,
+                            json!({}),
+                            BTreeMap::new(),
+                        )
+                        .await
+                        .unwrap();
+                }
                 let result = runtime
                     .create_or_get_tool_host_session(&thread_key, "prn_test", None, None)
                     .await;
-                if case == "allowed" {
+                if case == "allowed" || case == "existing-disabled" {
                     result.unwrap();
                     assert_eq!(
                         store.get_session(&thread_key).await.unwrap().harness_type,

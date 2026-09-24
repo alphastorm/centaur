@@ -16,9 +16,18 @@ turn.
   Pending control acknowledgements survive turn boundaries, including model
   changes between turns. Unknown ids and more than 1,024 pending controls fail
   closed rather than being accepted or retained without a bound.
+  OMP 18.3 terminal events have no prompt id: Centaur requires the active
+  agent lifecycle and a correlated `get_state` response confirming it is no
+  longer streaming before settling. Duplicate terminals before the next agent
+  starts and stale terminals while it is streaming are consumed, not applied
+  to the new turn.
 - **Durable session mapping** — Centaur stores the OMP session id and session
   file under the configured state root. A resumed thread must prove that both
   still match; it never scans or adopts an arbitrary session file.
+  Mapping filenames are the SHA-256 of the complete thread key, so 512-byte
+  keys and keys sharing a long prefix remain distinct without exceeding
+  filesystem filename limits. The full key is retained inside the mapping and
+  checked on every load.
   Production blocks mode uses the sandbox's stable `CENTAUR_THREAD_KEY` to
   recover that mapping after restart. Keep the state root on persistent storage;
   a fresh state root has no history to resume. Direct blocks invocations without
@@ -27,12 +36,24 @@ turn.
   under that volume alongside the other harness state. `stateVolume.enabled`
   is false by default: without retained storage, replacing a sandbox starts a
   new OMP session, even though harness-process restarts retain its history.
+  The configured root is canonicalized once: the entrypoint's `~/.omp` symlink
+  and session paths through it are supported, but symlinks inside the canonical
+  session root (including the mappings directory) are refused.
 - **Protocol v2 frames** — Centaur negotiates OMP RPC v2 and strictly validates
   chunk order, byte counts, JSON, and configured frame bounds before mapping
   output to Centaur's app-server events.
+  Unknown event kinds or assistant-update kinds, and missing or non-boolean
+  `agent_end.isTerminal`, fail the turn closed. Known presentation-only events
+  remain accepted. Only accepted frames refresh the idle watchdog; the
+  30-second command deadline is absolute across all chunks of a response.
 - **Graceful control** — a steer is appended to the active turn and an
   interrupt sends OMP `abort` before the process is reaped as a deadline
   fallback. A prompt acknowledgement is not treated as turn completion.
+  A non-retry OMP error first aborts the child turn (with the same forced-stop
+  fallback); only then is failure emitted to the session runtime.
+  `command_output.text` is a final result only for a local-only prompt
+  (`agentInvoked=false`). Otherwise it is command/tool output, so interrupting
+  after command output alone remains cancelled rather than becoming success.
   User messages received during an active blocks turn steer that same turn.
   After a forced abort, child exit, or malformed output, the next turn starts a
   fresh child and resumes the validated mapping instead of losing a turn or
@@ -51,7 +72,7 @@ turn.
 | `CENTAUR_OMP_BIN` | Operator-owned `omp` executable path; defaults to `omp` on `PATH`. Absolute overrides are canonicalized and must be executable. |
 | `CENTAUR_OMP_SESSION_ROOT` | Absolute root for OMP session files and Centaur mappings; defaults to `/home/agent/.omp/centaur-sessions`. |
 | `CENTAUR_THREAD_KEY` | Stable thread identity supplied by the session runtime for blocks-mode mapping recovery. |
-| `OMP_AUTH_MODE` | Optional auth-mode selection used when the API control plane registers the OMP credential proxy fragment. |
+| `CLAUDE_CODE_AUTH_MODE` | Shared OMP/Claude Code proxy auth mode: `api_key` (default) or `access_token`. OMP reuses the Claude Code fragment and its sandbox auth configuration. |
 
 The sandbox image pins `@oh-my-pi/pi-coding-agent` and verifies
 `omp/18.3.0` before starting it. The built-in `centaur-safe` profile limits the
@@ -59,10 +80,21 @@ model-visible local tool surface to `bash`, `edit`, `glob`, `grep`, `lsp`,
 `read`, `task`, `todo`, and `write`; startup reads OMP state and fails if the
 effective tool set or queue/interrupt modes differ.
 
+OMP cannot be the warm-pool harness: startup rejects
+`SESSION_SANDBOX_HARNESS=omp` with `SESSION_SANDBOX_WARM_POOL_SIZE` greater than
+zero, because warm sandboxes boot before `CENTAUR_THREAD_KEY` is known. Use a
+zero-sized pool for that default, or retain another default harness and admit
+OMP threads individually.
+
 OMP currently reuses the Claude Code iron-proxy fragment, which covers
 `api.anthropic.com`, not every provider OMP supports. Only Anthropic models are
 admitted. Managed sandboxes receive provider credential placeholders; iron-proxy
-resolves real credentials outside the sandbox. Provider connectivity must be
+resolves real credentials outside the sandbox. The OMP child receives only
+the approved Anthropic placeholder and transport environment; `OPENAI_*`,
+`GEMINI_*`, `AWS_*`, and `GOOGLE_*` variables are not inherited. The shared
+Claude Code fragment is registered once, including when OMP is the primary
+proxy engine. Its API-key mode replaces `X-Api-Key`, matching OMP 18.3.0
+requests to the official Anthropic endpoint. Provider connectivity must be
 validated separately before widening an allowlist.
 
 ## Selecting OMP
@@ -80,7 +112,9 @@ thread to another harness follows Centaur's normal restart policy.
 The rollout flag and exact thread allowlist are admission gates at the shared
 session runtime boundary: HTTP creation, harness switches, workflow
 `ctx.agent_turn` overrides, and tool-host session creation all use the same
-check. Disabling admission does not
+check. Create-or-get first loads the durable session: an existing OMP session
+still loads when admission is disabled, while a new OMP session or a switch
+into OMP is refused. Disabling admission does not
 terminate an existing OMP execution or prevent an already admitted session from
 executing again. Direct operator invocation of `harness-server omp` is not
 control-plane session creation; its local profile still requires enablement

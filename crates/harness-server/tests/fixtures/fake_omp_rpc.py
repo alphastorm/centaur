@@ -39,6 +39,8 @@ steer_event = threading.Event()
 ignore_abort = False
 late_control = False
 silent_controls = False
+error_turn_active = False
+streaming = False
 
 
 def raw_line(data: bytes) -> None:
@@ -47,8 +49,12 @@ def raw_line(data: bytes) -> None:
         sys.stdout.buffer.flush()
 
 
-def emit(obj: dict[str, Any], *, force_chunk: bool = False) -> None:
-    global chunk_seq
+def emit(obj: dict[str, Any], *, force_chunk: bool = False, chunk_delay: float = 0) -> None:
+    global chunk_seq, streaming
+    if obj.get("type") == "agent_start":
+        streaming = True
+    elif obj.get("type") == "agent_end" and obj.get("isTerminal") is True:
+        streaming = False
     raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     with state_lock:
         use_v2 = protocol_version == 2
@@ -58,6 +64,8 @@ def emit(obj: dict[str, Any], *, force_chunk: bool = False) -> None:
             chunk_id = f"rpc-{chunk_seq}"
         pieces = [raw[index:index + 220] for index in range(0, len(raw), 220)]
         for index, piece in enumerate(pieces):
+            if chunk_delay:
+                time.sleep(chunk_delay)
             raw_line(json.dumps({
                 "type": "rpc_chunk",
                 "chunkId": chunk_id,
@@ -86,7 +94,7 @@ def current_state() -> dict[str, Any]:
     return {
         "model": model.copy(),
         "thinkingLevel": "medium",
-        "isStreaming": False,
+        "isStreaming": streaming,
         "isCompacting": False,
         "steeringMode": "one-at-a-time",
         "followUpMode": "one-at-a-time",
@@ -163,8 +171,8 @@ def assistant_events(text: str, *, nonterminal: bool = False,
           "messages": [], "reason": "end_turn"})
 
 
-def delayed_normal(text: str, **kwargs: Any) -> None:
-    time.sleep(0.01)
+def delayed_normal(text: str, *, delay: float = 0.01, **kwargs: Any) -> None:
+    time.sleep(delay)
     assistant_events(text, **kwargs)
 
 
@@ -184,7 +192,7 @@ def wait_for_steer(request_id: str | None) -> None:
 
 def handle_prompt(cmd: dict[str, Any]) -> None:
     global pending_ui, pending_host_tool, pending_host_uri, last_assistant_text
-    global ignore_abort, late_control, silent_controls
+    global ignore_abort, late_control, silent_controls, error_turn_active
     request_id = cmd.get("id")
     message = str(cmd.get("message", ""))
     ignore_abort = "__ignore_abort__" in message
@@ -192,8 +200,13 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
     silent_controls = "__silent_controls__" in message
     if "__local__" in message:
         emit({"type": "command_output", "id": request_id, "command": "/fake",
-              "output": "local command completed"})
+              "text": "local command completed"})
         response("prompt", request_id, data={"agentInvoked": False})
+        return
+    if "__local_result__" in message:
+        emit({"type": "command_output", "text": "local prompt result"})
+        emit({"type": "prompt_result", "id": request_id, "agentInvoked": False})
+        response("prompt", request_id)
         return
     if "__early__" in message:
         emit({"type": "agent_start"})
@@ -211,7 +224,53 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
         threading.Thread(target=wait_for_steer, args=(request_id,), daemon=True).start()
         return
     response("prompt", request_id, data={"agentInvoked": True})
-    if "__late_error__" in message:
+    emit({"type": "agent_start"})
+    if "__presentation__" in message:
+        for kind in ("available_commands_update", "config_update", "session_info_update",
+                     "thinking_level_changed", "model_changed", "config_warnings_changed",
+                     "advisor_cost_changed", "advisor_yielded", "tool_stream_update",
+                     "auto_compaction_start", "auto_compaction_end", "auto_retry_start",
+                     "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered",
+                     "todo_reminder", "todo_auto_clear", "irc_message", "goal_updated"):
+            emit({"type": kind})
+        for kind in ("start", "text_start", "text_end", "thinking_start", "thinking_end",
+                     "image_end", "toolcall_start", "toolcall_delta", "toolcall_end", "done", "error"):
+            emit({"type": "message_update", "message": {"role": "assistant", "id": "presentation"},
+                  "assistantMessageEvent": {"type": kind}})
+        assistant_events("known presentation accepted")
+    elif "__provider_env__" in message:
+        names = sorted(name for name in os.environ if name.startswith(("OPENAI_", "GEMINI_", "AWS_", "GOOGLE_")))
+        assistant_events("non-anthropic env:" + (",".join(names) or "none"))
+    elif "__duplicate_terminal__" in message:
+        assistant_events("first turn")
+        emit({"type": "agent_end", "isTerminal": True, "messages": []})
+    elif "__stale_terminal_during_turn__" in message:
+        emit({"type": "agent_start"})
+        raw_line(b'{"type":"agent_end","isTerminal":true,"messages":[]}')
+        threading.Thread(target=delayed_normal, args=("current turn after stale terminal",),
+                         kwargs={"delay": 0.2}, daemon=True).start()
+    elif "__unknown_event__" in message:
+        emit({"type": "unrecognized_turn_event"})
+        emit({"type": "agent_end", "isTerminal": True, "messages": []})
+    elif "__missing_terminal__" in message:
+        emit({"type": "agent_end", "messages": []})
+    elif "__nonboolean_terminal__" in message:
+        emit({"type": "agent_end", "isTerminal": "true", "messages": []})
+    elif "__unknown_update__" in message:
+        emit({"type": "message_update", "message": {"role": "assistant", "id": "unknown"},
+              "assistantMessageEvent": {"type": "unknown_delta"}})
+        emit({"type": "agent_end", "isTerminal": True, "messages": []})
+    elif "__command_then_abort__" in message:
+        abort_event.clear()
+        emit({"type": "command_output", "id": request_id, "command": "/fake",
+              "text": "command output before abort"})
+        threading.Thread(target=wait_for_abort, daemon=True).start()
+    elif "__error_keeps_running__" in message:
+        abort_event.clear()
+        error_turn_active = True
+        emit({"type": "notice", "level": "error", "message": "fake active turn failure"})
+        threading.Thread(target=wait_for_abort, daemon=True).start()
+    elif "__late_error__" in message:
         emit({"type": "agent_start"})
         time.sleep(0.01)
         response("prompt", request_id, success=False, error="fake async scheduling failure")
@@ -286,7 +345,7 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
 
 def handle(cmd: dict[str, Any]) -> None:
     global protocol_version, session_id, session_file, model, pending_ui, pending_host_tool
-    global pending_host_uri
+    global pending_host_uri, error_turn_active
     typ = cmd.get("type")
     request_id = cmd.get("id")
     if typ == "negotiate_protocol":
@@ -297,6 +356,11 @@ def handle(cmd: dict[str, Any]) -> None:
         with state_lock:
             protocol_version = 2
     elif typ == "get_state":
+        if cmd.get("slowChunks"):
+            emit({"type": "response", "id": request_id, "command": "get_state",
+                  "success": True, "data": {"padding": "x" * 8000}},
+                 force_chunk=True, chunk_delay=0.04)
+            return
         for kind in ("model_changed", "config_warnings_changed", "advisor_cost_changed"):
             emit({"type": kind})
         response("get_state", request_id, data=current_state())
@@ -332,6 +396,9 @@ def handle(cmd: dict[str, Any]) -> None:
             emit({"type": "agent_end", "isTerminal": True,
                   "messages": [], "reason": "aborted"})
         response("abort", request_id, data={"aborted": True})
+        if error_turn_active:
+            (session_root / "error-turn-aborted").touch()
+            error_turn_active = False
         abort_event.set()
     elif typ == "extension_ui_response":
         if cmd.get("id") == "cancel-notification":

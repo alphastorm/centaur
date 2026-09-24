@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::Result;
@@ -117,12 +118,7 @@ fn mapping_path(profile: &OmpProfile, thread_id: &str) -> PathBuf {
 }
 
 fn mapping_filename(thread_id: &str) -> String {
-    let mut encoded = String::with_capacity(thread_id.len().saturating_mul(2).saturating_add(5));
-    for byte in thread_id.as_bytes().iter().take(256) {
-        use std::fmt::Write as _;
-        let _ = write!(&mut encoded, "{byte:02x}");
-    }
-    format!("{encoded}.json")
+    format!("{:x}.json", Sha256::digest(thread_id.as_bytes()))
 }
 
 fn reject_symlink_if_present(path: &Path) -> Result<()> {
@@ -136,7 +132,71 @@ fn reject_symlink_if_present(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mapping_filename, reject_symlink_if_present};
+    use super::*;
+
+    #[test]
+    fn long_thread_keys_with_shared_prefix_resume_distinct_sessions() {
+        let root = std::env::temp_dir().join(format!("omp-long-key-{}", Uuid::new_v4()));
+        let profile = OmpProfile::for_test(PathBuf::from("unused"), &root);
+        let session_file = profile.session_root().join("session.jsonl");
+        fs::write(&session_file, b"{}").unwrap();
+        let first = format!("{}{}", "x".repeat(256), "a".repeat(256));
+        let second = format!("{}{}", "x".repeat(256), "b".repeat(256));
+        let result = (|| -> Result<()> {
+            save(
+                &profile,
+                &SessionMapping::new(&first, "first".into(), session_file.clone()),
+            )?;
+            save(
+                &profile,
+                &SessionMapping::new(&second, "second".into(), session_file),
+            )?;
+            let first_mapping = load(&profile, &first)?.unwrap();
+            let second_mapping = load(&profile, &second)?.unwrap();
+            assert_eq!(
+                (first_mapping.thread_id, first_mapping.session_id),
+                (first, "first".into())
+            );
+            assert_eq!(
+                (second_mapping.thread_id, second_mapping.session_id),
+                (second, "second".into())
+            );
+            Ok(())
+        })();
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn mapping_filename_uses_the_entire_thread_key() {
+        let prefix = "x".repeat(256);
+        assert_ne!(
+            mapping_filename(&format!("{prefix}a")),
+            mapping_filename(&format!("{prefix}b"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_mismatched_full_thread_key() {
+        let root = std::env::temp_dir().join(format!("omp-key-identity-{}", Uuid::new_v4()));
+        let profile = OmpProfile::for_test(PathBuf::from("unused"), &root);
+        let session_file = profile.session_root().join("session.jsonl");
+        fs::write(&session_file, b"{}").unwrap();
+        let mapping = SessionMapping::new("other", "session".into(), session_file);
+        fs::write(
+            mapping_path(&profile, "requested"),
+            serde_json::to_vec(&mapping).unwrap(),
+        )
+        .unwrap();
+        let result = load(&profile, "requested");
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match thread")
+        );
+    }
 
     #[test]
     fn mapping_filename_cannot_escape_directory() {

@@ -897,6 +897,11 @@ impl SandboxArgs {
     }
 
     async fn runtime(&self) -> Result<SandboxRuntime, ServerError> {
+        if self.default_harness == HarnessType::Omp && self.warm_pool_size > 0 {
+            return Err(ServerError::UnsupportedConfig(
+                "SESSION_SANDBOX_WARM_POOL_SIZE must be 0 when SESSION_SANDBOX_HARNESS=omp: warm sandboxes boot without CENTAUR_THREAD_KEY".to_owned(),
+            ));
+        }
         match self.backend {
             SandboxBackendKind::Local => Ok(SandboxRuntime::backend_with_workload(
                 Arc::new(LocalSandboxBackend::new()),
@@ -2201,12 +2206,11 @@ fn merge_fragment(target: &mut ProxyFragment, source: ProxyFragment) {
 fn harness_auth_mode_env(engine: &HarnessType) -> Option<String> {
     match engine {
         HarnessType::Codex | HarnessType::Nanocodex => env::var("CODEX_AUTH_MODE").ok(),
-        HarnessType::ClaudeCode => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
+        HarnessType::ClaudeCode | HarnessType::Omp => env::var("CLAUDE_CODE_AUTH_MODE").ok(),
         HarnessType::Amp => None,
         // Hermes resolves providers through its own credential store /
         // iron-proxy placeholder injection; no dedicated auth-mode env.
         HarnessType::Hermes => None,
-        HarnessType::Omp => env::var("OMP_AUTH_MODE").ok(),
     }
 }
 
@@ -3597,6 +3601,110 @@ mod tests {
             harness_fragment_engine_name(&HarnessType::Omp),
             "claude-code"
         );
+    }
+
+    #[tokio::test]
+    async fn omp_warm_pool_is_rejected_at_startup() {
+        for (harness, size, rejected) in [
+            ("codex", "1", false),
+            ("omp", "0", false),
+            ("omp", "1", true),
+        ] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--session-sandbox-backend",
+                "local",
+                "--session-sandbox-workload",
+                "mock",
+                "--session-sandbox-harness",
+                harness,
+                "--session-sandbox-warm-pool-size",
+                size,
+            ])
+            .unwrap();
+
+            let result = args.sandbox_runtime().await;
+            if rejected {
+                assert!(matches!(result, Err(ServerError::UnsupportedConfig(_))));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "{harness} with pool size {size} must remain supported"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn omp_uses_claude_code_auth_mode_for_proxy_credentials() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for (mode, obsolete_mode) in [("access_token", "api_key"), ("api_key", "access_token")] {
+            let _env = EnvGuard::set(&[
+                ("CLAUDE_CODE_AUTH_MODE", mode),
+                ("OMP_AUTH_MODE", obsolete_mode),
+            ]);
+            let fragment = IronProxyHarnessArgs {
+                engine: HarnessType::Omp,
+                auth_mode: None,
+            }
+            .fragment()
+            .unwrap();
+            let secrets: Vec<_> = fragment
+                .transforms
+                .iter()
+                .flat_map(|transform| &transform.config.secrets)
+                .collect();
+            assert_eq!(secrets.len(), 1);
+            if mode == "access_token" {
+                assert_eq!(
+                    secrets[0].source.as_ref().unwrap()["credential_id"].as_str(),
+                    Some("anthropic-claude")
+                );
+                assert_eq!(
+                    secrets[0].inject.as_ref().unwrap()["header"].as_str(),
+                    Some("Authorization")
+                );
+                assert!(secrets[0].replace.is_none());
+            } else {
+                assert_eq!(
+                    secrets[0].replace.as_ref().unwrap().proxy_value.as_deref(),
+                    Some("ANTHROPIC_API_KEY")
+                );
+                assert!(secrets[0].source.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn omp_and_claude_code_register_one_anthropic_credential() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[("CLAUDE_CODE_AUTH_MODE", "api_key")]);
+        for engine in [
+            HarnessType::Codex,
+            HarnessType::ClaudeCode,
+            HarnessType::Omp,
+        ] {
+            let fragments = IronProxyHarnessArgs {
+                engine,
+                auth_mode: Some("api_key".to_owned()),
+            }
+            .fragments()
+            .unwrap();
+            let anthropic_credentials = fragments
+                .iter()
+                .flat_map(|fragment| &fragment.transforms)
+                .flat_map(|transform| &transform.config.secrets)
+                .filter(|secret| {
+                    secret
+                        .rules
+                        .iter()
+                        .any(|rule| rule["host"].as_str() == Some("api.anthropic.com"))
+                })
+                .count();
+            assert_eq!(anthropic_credentials, 1);
+        }
     }
 
     #[test]
