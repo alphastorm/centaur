@@ -1142,11 +1142,6 @@ impl SandboxArgs {
         {
             envs.push(("CLAUDE_CODE_AUTH_MODE".to_owned(), mode));
         }
-        for name in ["CENTAUR_OMP_ENABLED", "CENTAUR_OMP_ALLOWED_MODELS"] {
-            if let Some(value) = clean_optional_value(env::var(name).ok().as_deref()) {
-                envs.push((name.to_owned(), value));
-            }
-        }
 
         // Inject the infra/harness placeholder credentials so env-based
         // consumers send the proxy_value iron-proxy replaces with the real
@@ -3587,20 +3582,6 @@ mod tests {
             args.sandbox.iron_proxy.harness.engine,
             HarnessType::ClaudeCode
         );
-
-        let omp_args = Args::try_parse_from([
-            "centaur-api-server",
-            "--database-url",
-            "postgres://postgres:postgres@localhost/centaur",
-            "--kubernetes-iron-proxy-harness-engine",
-            "omp",
-        ])
-        .unwrap();
-        assert_eq!(omp_args.sandbox.iron_proxy.harness.engine, HarnessType::Omp);
-        assert_eq!(
-            harness_fragment_engine_name(&HarnessType::Omp),
-            "claude-code"
-        );
     }
 
     #[tokio::test]
@@ -3640,11 +3621,8 @@ mod tests {
     #[test]
     fn omp_uses_claude_code_auth_mode_for_proxy_credentials() {
         let _lock = ENV_LOCK.lock().unwrap();
-        for (mode, obsolete_mode) in [("access_token", "api_key"), ("api_key", "access_token")] {
-            let _env = EnvGuard::set(&[
-                ("CLAUDE_CODE_AUTH_MODE", mode),
-                ("OMP_AUTH_MODE", obsolete_mode),
-            ]);
+        for mode in ["access_token", "api_key"] {
+            let _env = EnvGuard::set(&[("CLAUDE_CODE_AUTH_MODE", mode)]);
             let fragment = IronProxyHarnessArgs {
                 engine: HarnessType::Omp,
                 auth_mode: None,
@@ -3677,33 +3655,44 @@ mod tests {
         }
     }
 
+    /// OMP picks providers the stock way, so its sandbox must reach both
+    /// providers upstream ships fragments for: Anthropic through the Claude
+    /// Code fragment and OpenAI through the Codex fragment, each registered
+    /// exactly once whichever harness is primary.
     #[test]
-    fn omp_and_claude_code_register_one_anthropic_credential() {
+    fn omp_proxy_registers_anthropic_and_openai_credentials_once() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _env = EnvGuard::set(&[("CLAUDE_CODE_AUTH_MODE", "api_key")]);
+        let _env = EnvGuard::set(&[
+            ("CLAUDE_CODE_AUTH_MODE", "api_key"),
+            ("CODEX_AUTH_MODE", "api_key"),
+            ("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        ]);
         for engine in [
             HarnessType::Codex,
             HarnessType::ClaudeCode,
             HarnessType::Omp,
         ] {
             let fragments = IronProxyHarnessArgs {
-                engine,
+                engine: engine.clone(),
                 auth_mode: Some("api_key".to_owned()),
             }
             .fragments()
             .unwrap();
-            let anthropic_credentials = fragments
-                .iter()
-                .flat_map(|fragment| &fragment.transforms)
-                .flat_map(|transform| &transform.config.secrets)
-                .filter(|secret| {
-                    secret
-                        .rules
-                        .iter()
-                        .any(|rule| rule["host"].as_str() == Some("api.anthropic.com"))
-                })
-                .count();
-            assert_eq!(anthropic_credentials, 1);
+            let credentials_for = |host: &str| {
+                fragments
+                    .iter()
+                    .flat_map(|fragment| &fragment.transforms)
+                    .flat_map(|transform| &transform.config.secrets)
+                    .filter(|secret| {
+                        secret
+                            .rules
+                            .iter()
+                            .any(|rule| rule["host"].as_str() == Some(host))
+                    })
+                    .count()
+            };
+            assert_eq!(credentials_for("api.anthropic.com"), 1, "{engine:?}");
+            assert_eq!(credentials_for("api.openai.com"), 1, "{engine:?}");
         }
     }
 
