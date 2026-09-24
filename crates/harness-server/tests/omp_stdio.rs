@@ -519,3 +519,69 @@ fn stock_omp_image_bytes_use_native_provider_limits() {
     ]}));
     assert_eq!(deltas(&bridge.finish()), "image count=1");
 }
+
+#[test]
+#[ignore = "requires ANTHROPIC_API_KEY and real OMP; makes provider calls"]
+fn real_omp_streaming_steer_and_resume() {
+    assert!(
+        std::env::var("ANTHROPIC_API_KEY").is_ok_and(|key| !key.is_empty()),
+        "set ANTHROPIC_API_KEY before running real OMP tests"
+    );
+    let binary = std::env::var_os("CENTAUR_OMP_BIN").unwrap_or_else(|| "omp".into());
+    let version = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("real omp on PATH or CENTAUR_OMP_BIN");
+    assert!(version.status.success(), "OMP --version failed");
+    let model = std::env::var("CENTAUR_REAL_OMP_MODEL")
+        .unwrap_or_else(|_| "anthropic/claude-sonnet-4-5".to_string());
+    let root = TestRoot::new();
+    let codeword = format!("OMP_MEMORY_{}", Uuid::new_v4().simple());
+    let acknowledgement = format!("STEER_{}", Uuid::new_v4().simple());
+    let timeout = Duration::from_secs(300);
+    let mut bridge = Bridge::with_binary(&root, Some(KEY), &binary, &[], timeout);
+    bridge.send(json!({
+        "type": "user", "model": model,
+        "text": format!("Remember the codeword {codeword} for later. Do not use tools. Produce 300 lines numbered 001 through 300, each followed by the words: streaming output remains visible while a steering update arrives. If an update arrives, follow it.")
+    }));
+    let mut values = bridge.until(|value| method(value) == "item/agentMessage/delta");
+    bridge.send(json!({
+        "type": "user", "client_user_message_id": "real-omp-steer",
+        "text": format!("Stop the numbered listing. Remember the codeword {codeword}. Reply exactly {acknowledgement} and nothing else.")
+    }));
+    values.extend(bridge.finish());
+    assert_eq!(status(&values), "completed");
+    let delta_count = values
+        .iter()
+        .filter(|value| method(value) == "item/agentMessage/delta")
+        .count();
+    assert!(delta_count > 1, "OMP must preserve streaming deltas");
+    assert!(
+        deltas(&values).contains(&acknowledgement),
+        "OMP did not apply the steering update"
+    );
+    assert!(
+        completed(&values)
+            .pointer("/params/turn/items")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item.get("clientId") == Some(&json!("real-omp-steer")))
+    );
+    eprintln!(
+        "real OMP {}: streaming_deltas={delta_count}, steer=completed",
+        String::from_utf8_lossy(&version.stdout).trim()
+    );
+    drop(bridge);
+
+    let mut resumed = Bridge::with_binary(&root, Some(KEY), &binary, &[], timeout);
+    resumed.send(json!({
+        "type": "user", "model": model,
+        "text": "Without using tools, what exact codeword did I ask you to remember earlier? Reply with only that codeword."
+    }));
+    let recalled = resumed.finish();
+    assert_eq!(status(&recalled), "completed");
+    assert_eq!(deltas(&recalled).trim(), codeword);
+    eprintln!("real OMP: native resume recalled the codeword after child restart");
+}
