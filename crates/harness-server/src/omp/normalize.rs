@@ -8,9 +8,13 @@ use crate::traits::{
 
 pub(super) const MAX_RENDERED_TEXT_BYTES: usize = 1024 * 1024;
 
+/// OMP 18.3 assistant messages carry no stable id (only an optional provider
+/// `responseId`), so the normalizer numbers them from their `message_start`.
 #[derive(Debug, Default)]
 pub(crate) struct OmpEventNormalizer {
     command_output_index: usize,
+    assistant_message_index: usize,
+    active_assistant_item: Option<String>,
 }
 
 impl OmpEventNormalizer {
@@ -20,9 +24,10 @@ impl OmpEventNormalizer {
         match kind {
             "agent_start" | "turn_start" | "turn_end" | "agent_end" => {}
             "message_start" => {
-                if assistant_message(frame).is_some()
-                    && let Some(item_id) = message_id(frame)
-                {
+                if assistant_message(frame).is_some() {
+                    self.assistant_message_index += 1;
+                    let item_id = format!("omp-assistant-{}", self.assistant_message_index);
+                    self.active_assistant_item = Some(item_id.clone());
                     events.push(NormalizedEvent::AgentMessageStarted {
                         item_id,
                         stop_reason: None,
@@ -33,8 +38,9 @@ impl OmpEventNormalizer {
                 if assistant_message(frame).is_none() {
                     return Ok(events);
                 }
-                let item_id = message_id(frame)
-                    .ok_or_else(|| protocol_error("OMP assistant message_update omitted id"))?;
+                let item_id = self.active_assistant_item.clone().ok_or_else(|| {
+                    protocol_error("OMP assistant message_update arrived before message_start")
+                })?;
                 let update = frame
                     .get("assistantMessageEvent")
                     .and_then(Value::as_object)
@@ -68,11 +74,9 @@ impl OmpEventNormalizer {
             }
             "message_end" => {
                 if let Some(message) = assistant_message(frame) {
-                    let item_id = message
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| "omp-assistant".to_string());
+                    let item_id = self.active_assistant_item.take().ok_or_else(|| {
+                        protocol_error("OMP assistant message_end arrived before message_start")
+                    })?;
                     let content = normalized_content(message, &item_id);
                     if !content.is_empty() {
                         events.push(NormalizedEvent::AssistantMessage {
@@ -222,13 +226,6 @@ fn assistant_message(frame: &Value) -> Option<&serde_json::Map<String, Value>> {
     (message.get("role").and_then(Value::as_str) == Some("assistant")).then_some(message)
 }
 
-fn message_id(frame: &Value) -> Option<String> {
-    assistant_message(frame)?
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
 fn normalized_content(
     message: &serde_json::Map<String, Value>,
     fallback_id: &str,
@@ -354,36 +351,89 @@ mod tests {
     use serde_json::json;
 
     use super::OmpEventNormalizer;
-    use crate::traits::NormalizedEvent;
+    use crate::traits::{NormalizedContent, NormalizedEvent};
+
+    fn assistant_frame(kind: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut frame = json!({
+            "type": kind,
+            // OMP 18.3.0 assistant messages have no `id`; `responseId` is optional.
+            "message": {"role": "assistant", "responseId": "msg_provider"}
+        });
+        if let (Some(frame), Some(extra)) = (frame.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                if key == "message" {
+                    frame["message"]
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(value.as_object().unwrap().clone());
+                } else {
+                    frame.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        frame
+    }
+
+    fn item_id(event: &NormalizedEvent) -> &str {
+        match event {
+            NormalizedEvent::AgentMessageStarted { item_id, .. }
+            | NormalizedEvent::AgentTextDelta { item_id, .. } => item_id,
+            NormalizedEvent::AssistantMessage { content, .. } => match &content[0] {
+                NormalizedContent::AgentText { item_id, .. } => item_id,
+                other => panic!("unexpected content {other:?}"),
+            },
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
 
     #[test]
-    fn maps_text_delta_and_usage() {
+    fn attributes_real_shape_assistant_messages_to_numbered_items() {
         let mut normalizer = OmpEventNormalizer::default();
-        let events = normalizer
-            .normalize(&json!({
-                "type": "message_update",
-                "message": {"role": "assistant", "id": "m1"},
-                "assistantMessageEvent": {"type": "text_delta", "delta": "hello"}
-            }))
-            .unwrap();
-        assert!(
-            matches!(&events[0], NormalizedEvent::AgentTextDelta { delta, .. } if delta == "hello")
-        );
+        let mut item_ids = Vec::new();
+        for text in ["hello", "again"] {
+            let started = normalizer
+                .normalize(&assistant_frame("message_start", json!({})))
+                .unwrap();
+            let delta = normalizer
+                .normalize(&assistant_frame(
+                    "message_update",
+                    json!({"assistantMessageEvent": {"type": "text_delta", "delta": text}}),
+                ))
+                .unwrap();
+            assert!(
+                matches!(&delta[0], NormalizedEvent::AgentTextDelta { delta, .. } if delta == text)
+            );
+            let ended = normalizer
+                .normalize(&assistant_frame(
+                    "message_end",
+                    json!({"message": {
+                        "content": [{"type": "text", "text": text}],
+                        "usage": {"input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0}
+                    }}),
+                ))
+                .unwrap();
+            assert!(
+                ended
+                    .iter()
+                    .any(|event| matches!(event, NormalizedEvent::TokenUsage { .. }))
+            );
+            let id = item_id(&started[0]).to_owned();
+            assert_eq!(item_id(&delta[0]), id);
+            assert_eq!(item_id(&ended[0]), id);
+            item_ids.push(id);
+        }
+        assert_ne!(item_ids[0], item_ids[1]);
+    }
 
-        let events = normalizer
-            .normalize(&json!({
-                "type": "message_end",
-                "message": {
-                    "role": "assistant", "id": "m1",
-                    "content": [{"type": "text", "text": "hello"}],
-                    "usage": {"input": 3, "output": 2, "cacheRead": 1, "cacheWrite": 0}
-                }
-            }))
-            .unwrap();
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, NormalizedEvent::TokenUsage { .. }))
-        );
+    #[test]
+    fn assistant_update_without_message_start_fails_closed() {
+        let mut normalizer = OmpEventNormalizer::default();
+        let error = normalizer
+            .normalize(&assistant_frame(
+                "message_update",
+                json!({"assistantMessageEvent": {"type": "text_delta", "delta": "orphan"}}),
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("before message_start"));
     }
 }

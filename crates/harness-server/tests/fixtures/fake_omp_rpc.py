@@ -124,16 +124,16 @@ def assistant_events(text: str, *, nonterminal: bool = False,
     message_id = f"msg-{uuid.uuid4().hex[:8]}"
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
-    emit({"type": "message_start", "message": {"role": "assistant", "id": message_id}})
+    emit({"type": "message_start", "message": {"role": "assistant", "responseId": message_id}})
     if include_reasoning:
         emit({
             "type": "message_update",
-            "message": {"role": "assistant", "id": message_id},
+            "message": {"role": "assistant", "responseId": message_id},
             "assistantMessageEvent": {"type": "thinking_delta", "delta": "fake reasoning"},
         })
     emit({
         "type": "message_update",
-        "message": {"role": "assistant", "id": message_id},
+        "message": {"role": "assistant", "responseId": message_id},
         "assistantMessageEvent": {"type": "text_delta", "delta": text},
     }, force_chunk=force_chunk)
     if include_tool:
@@ -149,7 +149,7 @@ def assistant_events(text: str, *, nonterminal: bool = False,
     if include_reasoning:
         content.insert(0, {"type": "thinking", "thinking": "fake reasoning"})
     emit({"type": "message_end", "message": {
-        "role": "assistant", "id": message_id,
+        "role": "assistant", "responseId": message_id,
         "content": content,
         "usage": {"input": 10, "output": 4, "cacheRead": 2, "cacheWrite": 0},
     }})
@@ -160,10 +160,10 @@ def assistant_events(text: str, *, nonterminal: bool = False,
     if nonterminal:
         emit({"type": "agent_end", "isTerminal": False,
               "messages": [], "reason": "async-delivery-pending"})
-        emit({"type": "message_start", "message": {"role": "assistant", "id": message_id + "-2"}})
+        emit({"type": "message_start", "message": {"role": "assistant", "responseId": message_id + "-2"}})
         emit({
             "type": "message_update",
-            "message": {"role": "assistant", "id": message_id + "-2"},
+            "message": {"role": "assistant", "responseId": message_id + "-2"},
             "assistantMessageEvent": {"type": "text_delta", "delta": " continued"},
         })
         last_assistant_text = text + " continued"
@@ -210,11 +210,11 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
         return
     if "__early__" in message:
         emit({"type": "agent_start"})
-        emit({"type": "message_start", "message": {"role": "assistant", "id": "early-msg"}})
-        emit({"type": "message_update", "message": {"role": "assistant", "id": "early-msg"},
+        emit({"type": "message_start", "message": {"role": "assistant", "responseId": "early-msg"}})
+        emit({"type": "message_update", "message": {"role": "assistant", "responseId": "early-msg"},
               "assistantMessageEvent": {"type": "text_delta", "delta": "early "}})
         response("prompt", request_id, data={"agentInvoked": True})
-        emit({"type": "message_end", "message": {"role": "assistant", "id": "early-msg",
+        emit({"type": "message_end", "message": {"role": "assistant", "responseId": "early-msg",
               "content": [{"type": "text", "text": "early event retained"}]}})
         last_assistant_text = "early event retained"
         emit({"type": "agent_end", "isTerminal": True, "messages": [], "reason": "end_turn"})
@@ -233,10 +233,13 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
                      "retry_fallback_applied", "retry_fallback_succeeded", "ttsr_triggered",
                      "todo_reminder", "todo_auto_clear", "irc_message", "goal_updated"):
             emit({"type": kind})
+        emit({"type": "message_start", "message": {"role": "assistant", "responseId": "presentation"}})
         for kind in ("start", "text_start", "text_end", "thinking_start", "thinking_end",
                      "image_end", "toolcall_start", "toolcall_delta", "toolcall_end", "done", "error"):
-            emit({"type": "message_update", "message": {"role": "assistant", "id": "presentation"},
+            emit({"type": "message_update", "message": {"role": "assistant", "responseId": "presentation"},
                   "assistantMessageEvent": {"type": kind}})
+        emit({"type": "message_end", "message": {"role": "assistant", "responseId": "presentation",
+              "content": []}})
         assistant_events("known presentation accepted")
     elif "__provider_env__" in message:
         names = sorted(name for name in os.environ if name.startswith(("OPENAI_", "GEMINI_", "AWS_", "GOOGLE_")))
@@ -257,7 +260,8 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
     elif "__nonboolean_terminal__" in message:
         emit({"type": "agent_end", "isTerminal": "true", "messages": []})
     elif "__unknown_update__" in message:
-        emit({"type": "message_update", "message": {"role": "assistant", "id": "unknown"},
+        emit({"type": "message_start", "message": {"role": "assistant", "responseId": "unknown"}})
+        emit({"type": "message_update", "message": {"role": "assistant", "responseId": "unknown"},
               "assistantMessageEvent": {"type": "unknown_delta"}})
         emit({"type": "agent_end", "isTerminal": True, "messages": []})
     elif "__command_then_abort__" in message:
