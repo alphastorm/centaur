@@ -402,6 +402,57 @@ fn fake_omp_retried_provider_error_completes_with_retry_answer() {
     assert_eq!(deltas(&values), vec!["recovered after retry"]);
 }
 
+/// Replays turns captured verbatim from omp 18.3.0 (a loopback Anthropic mock,
+/// scrubbed of local paths) so the harness is exercised against real wire
+/// shapes rather than only hand-written frames.
+#[test]
+fn fake_omp_replays_captured_omp_18_3_turns() {
+    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
+    let thread_id = bridge.initialize_and_start();
+    let status = |values: &[Value]| {
+        completed(values)
+            .pointer("/params/turn/status")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned()
+    };
+    let error = |values: &[Value]| {
+        completed(values)
+            .pointer("/params/turn/error/message")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned()
+    };
+
+    let (_, text) = bridge.start_turn(3, &thread_id, "__replay:text");
+    assert_eq!(status(&text), "completed");
+    assert_eq!(deltas(&text).concat(), "PONG-1");
+
+    let (_, tool) = bridge.start_turn(4, &thread_id, "__replay:tool");
+    assert_eq!(status(&tool), "completed");
+    for method in ["item/started", "item/completed"] {
+        assert!(tool.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some(method)
+                && value.pointer("/params/item/tool").and_then(Value::as_str) == Some("bash")
+        }));
+    }
+    assert_eq!(deltas(&tool).concat(), "PONG-2");
+
+    let (_, rejected) = bridge.start_turn(5, &thread_id, "__replay:provider_error");
+    assert_eq!(status(&rejected), "failed");
+    let message = error(&rejected);
+    assert!(message.contains("Tracer non-retryable error"), "{message}");
+    assert!(!message.contains("raw-http-request"), "{message}");
+
+    let (_, truncated) = bridge.start_turn(6, &thread_id, "__replay:truncated_stream");
+    assert_eq!(status(&truncated), "failed");
+    assert!(error(&truncated).contains("stream ended before message_stop"));
+
+    let (_, recovered) = bridge.start_turn(7, &thread_id, "__replay:text");
+    assert_eq!(status(&recovered), "completed");
+    assert_eq!(deltas(&recovered).concat(), "PONG-1");
+}
+
 #[test]
 fn fake_omp_forced_abort_restarts_and_resumes_before_next_turn() {
     let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());

@@ -201,6 +201,22 @@ def provider_error_events(*, retried: bool) -> None:
     assistant_events("recovered after retry")
 
 
+REPLAY_DIR = pathlib.Path(__file__).with_name("omp-18.3.0")
+
+
+def replay_transcript(name: str) -> None:
+    """Emit one turn's frames exactly as captured from omp 18.3.0."""
+    global streaming
+    time.sleep(0.01)
+    for line in (REPLAY_DIR / f"{name}.jsonl").read_text(encoding="utf-8").splitlines():
+        frame = json.loads(line)
+        if frame.get("type") == "agent_start":
+            streaming = True
+        elif frame.get("type") == "agent_end" and frame.get("isTerminal") is True:
+            streaming = False
+        raw_line(line.encode("utf-8"))
+
+
 def wait_for_abort() -> None:
     global last_assistant_text
     emit({"type": "agent_start"})
@@ -247,6 +263,14 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
     if "__out_of_order__" in message:
         steer_event.clear()
         threading.Thread(target=wait_for_steer, args=(request_id,), daemon=True).start()
+        return
+    if "__replay:" in message:
+        name = message.split("__replay:", 1)[1].split()[0]
+        if not name.replace("_", "").isalpha():
+            raise ValueError(f"invalid transcript name {name!r}")
+        # Real 18.3.0 prompt acknowledgements carry no data.
+        response("prompt", request_id)
+        threading.Thread(target=replay_transcript, args=(name,), daemon=True).start()
         return
     response("prompt", request_id, data={"agentInvoked": True})
     emit({"type": "agent_start"})
