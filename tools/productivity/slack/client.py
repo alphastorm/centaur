@@ -917,7 +917,7 @@ class SlackClient:
                         "purpose": channel.get("purpose", {}).get("value", ""),
                         "topic": channel.get("topic", {}).get("value", ""),
                         "member_count": channel.get("num_members", 0),
-                        "is_private": channel.get("is_private", False),
+                        "is_private": channel.get("is_private", True),
                     }
                 )
 
@@ -1385,7 +1385,7 @@ class SlackClient:
                         "purpose": channel.get("purpose", {}).get("value", ""),
                         "topic": channel.get("topic", {}).get("value", ""),
                         "member_count": channel.get("num_members", 0),
-                        "is_private": channel.get("is_private", False),
+                        "is_private": channel.get("is_private", True),
                         "is_member": channel.get("is_member", False),
                     }
                 )
@@ -1428,7 +1428,9 @@ class SlackClient:
                 "purpose": channel.get("purpose", ""),
                 "topic": channel.get("topic", ""),
                 "member_count": channel.get("member_count", 0),
-                "is_private": channel.get("is_private", False),
+                "is_private": channel.get("is_private", True),
+                "is_im": channel.get("is_im", False),
+                "is_mpim": channel.get("is_mpim", False),
                 "is_member": channel.get("is_member", False),
                 "can_upload": channel.get("can_upload", False),
                 "can_download": channel.get("can_download", False),

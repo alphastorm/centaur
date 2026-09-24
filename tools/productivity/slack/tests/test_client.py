@@ -702,6 +702,34 @@ def test_list_channels_proxy_paginates_and_passes_query() -> None:
     ]
 
 
+def test_list_channels_proxy_preserves_conversation_type() -> None:
+    client, _ = _make_client()
+
+    def fake_get_json(path, params):
+        assert path == "/api/slack/channels"
+        return {
+            "ok": True,
+            "channels": [
+                {"id": "C111111111", "is_private": False, "can_read_history": True},
+                {"id": "D222222222", "is_im": True, "can_read_history": True},
+                {"id": "G333333333", "is_mpim": True, "can_read_history": True},
+            ],
+            "response_metadata": {"next_cursor": ""},
+        }
+
+    client._centaur_api_get_json = fake_get_json  # type: ignore[method-assign]
+
+    rows = {channel["id"]: channel for channel in client.list_channels_proxy()}
+
+    assert rows["C111111111"]["is_private"] is False
+    assert rows["C111111111"]["is_im"] is False
+    assert rows["C111111111"]["is_mpim"] is False
+    assert rows["D222222222"]["is_private"] is True
+    assert rows["D222222222"]["is_im"] is True
+    assert rows["G333333333"]["is_private"] is True
+    assert rows["G333333333"]["is_mpim"] is True
+
+
 def test_list_files_proxy_calls_centaur_api() -> None:
     client, _ = _make_client()
 
@@ -1338,6 +1366,8 @@ def test_list_bot_channels_uses_users_conversations() -> None:
             "channels": [
                 {"id": "C1", "name": "zeta", "is_private": False, "num_members": 3},
                 {"id": "C2", "name": "alpha", "is_private": True, "num_members": 5},
+                # Missing privacy metadata fails closed.
+                {"id": "C3", "name": "beta", "num_members": 1},
             ],
             "response_metadata": {"next_cursor": ""},
         }
@@ -1356,10 +1386,11 @@ def test_list_bot_channels_uses_users_conversations() -> None:
 
     # Every conversation returned by the API is kept (membership is implied),
     # sorted by name, with the expected fields preserved.
-    assert [c["id"] for c in result] == ["C2", "C1"]
-    assert [c["name"] for c in result] == ["alpha", "zeta"]
+    assert [c["id"] for c in result] == ["C2", "C3", "C1"]
+    assert [c["name"] for c in result] == ["alpha", "beta", "zeta"]
     assert result[0]["is_private"] is True
-    assert result[1]["member_count"] == 3
+    assert result[1]["is_private"] is True
+    assert result[2]["member_count"] == 3
 
 
 def test_get_thread_replies_page_uses_bounded_default() -> None:
