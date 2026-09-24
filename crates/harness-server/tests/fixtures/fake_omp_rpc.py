@@ -12,7 +12,7 @@ import time
 import uuid
 from typing import Any
 if "--version" in sys.argv:
-    print("omp/17.1.3")
+    print("omp/18.3.0")
     raise SystemExit(0)
 
 
@@ -91,6 +91,9 @@ def current_state() -> dict[str, Any]:
         "sessionId": session_id,
         "sessionName": "Fake Centaur session",
         "autoCompactionEnabled": True,
+        "fastModeEnabled": False,
+        "fastModeActive": False,
+        "tokensPerSecond": None,
         "messageCount": 0,
         "queuedMessageCount": 0,
         "todoPhases": [],
@@ -202,6 +205,16 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
         emit({"type": "agent_start"})
         time.sleep(0.01)
         response("prompt", request_id, success=False, error="fake async scheduling failure")
+    elif "__persistence_error__" in message:
+        emit({"type": "notice", "level": "error", "source": "session-persistence",
+              "message": "private-store-path: write failed"})
+    elif "__ui_select__" in message:
+        pending_ui = f"ui-{uuid.uuid4().hex[:8]}"
+        emit({"type": "extension_ui_request", "id": "cancel-notification",
+              "method": "cancel", "targetId": "already-cancelled"})
+        emit({"type": "extension_ui_request", "id": pending_ui,
+              "method": "select", "title": "Choose", "options": ["Allow"],
+              "optionDetails": [{"description": "Must remain denied"}]})
     elif "__reasoning__" in message:
         threading.Thread(target=delayed_normal, args=("reasoned",),
                          kwargs={"include_reasoning": True}, daemon=True).start()
@@ -253,6 +266,8 @@ def handle(cmd: dict[str, Any]) -> None:
         with state_lock:
             protocol_version = 2
     elif typ == "get_state":
+        for kind in ("model_changed", "config_warnings_changed", "advisor_cost_changed"):
+            emit({"type": kind})
         response("get_state", request_id, data=current_state())
     elif typ == "get_available_models":
         response("get_available_models", request_id,
@@ -277,6 +292,9 @@ def handle(cmd: dict[str, Any]) -> None:
         response("abort", request_id, data={"aborted": True})
         abort_event.set()
     elif typ == "extension_ui_response":
+        if cmd.get("id") == "cancel-notification":
+            response("extension_ui_response", "cancel-notification", success=False,
+                     error="notification must not receive a response")
         if cmd.get("id") == pending_ui:
             pending_ui = None
             emit({"type": "agent_end", "isTerminal": True, "messages": [], "reason": "ui-denied"})

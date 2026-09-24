@@ -13,7 +13,8 @@ use crate::omp::normalize::OmpEventNormalizer;
 use crate::omp::persistence::{self, SessionMapping};
 use crate::omp::profile::{OmpProfile, validate_contained_session_path};
 use crate::omp::protocol::{
-    Decoder, MAX_PHYSICAL_FRAME_BYTES, frame_type, parse_ready, protocol_error,
+    Decoder, MAX_PHYSICAL_FRAME_BYTES, frame_type, is_state_notification, parse_ready,
+    protocol_error,
 };
 use crate::stateful::{ProcessEvent, StatefulProcess};
 use crate::traits::{HarnessKind, NormalizedEvent, NormalizedTokenUsage};
@@ -484,13 +485,7 @@ impl OmpSession {
                 self.deny_callback(&frame)?;
                 continue;
             }
-            if !matches!(
-                kind,
-                "available_commands_update"
-                    | "config_update"
-                    | "session_info_update"
-                    | "thinking_level_changed"
-            ) {
+            if !is_state_notification(kind) {
                 return Err(protocol_error(format!(
                     "OMP emitted semantic frame {kind} while awaiting {command}"
                 )));
@@ -500,12 +495,35 @@ impl OmpSession {
 
     fn deny_callback(&mut self, frame: &Value) -> Result<()> {
         let kind = frame_type(frame)?;
+        if kind == "extension_ui_request"
+            && matches!(
+                frame.get("method").and_then(Value::as_str),
+                Some(
+                    "cancel"
+                        | "notify"
+                        | "setStatus"
+                        | "setWidget"
+                        | "setTitle"
+                        | "set_editor_text"
+                        | "open_url"
+                )
+            )
+        {
+            // Presentation updates and 18.3 dialog cancellation have no reply.
+            return Ok(());
+        }
         let id = frame
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| protocol_error("OMP privileged callback omitted string id"))?;
         let response = match kind {
             "extension_ui_request" => {
+                if !matches!(
+                    frame.get("method").and_then(Value::as_str),
+                    Some("select" | "confirm" | "input" | "editor")
+                ) {
+                    return Err(protocol_error("unknown OMP extension UI request"));
+                }
                 json!({"type": "extension_ui_response", "id": id, "cancelled": true})
             }
             "host_tool_call" => json!({
@@ -537,7 +555,18 @@ impl OmpSession {
 
     fn recv_frame(&mut self, timeout: Duration) -> Result<Option<Value>> {
         match self.process.recv_timeout(timeout) {
-            Ok(ProcessEvent::Frame(line)) => self.decoder.decode_line(&line),
+            Ok(ProcessEvent::Frame(line)) => {
+                let frame = self.decoder.decode_line(&line)?;
+                if frame.as_ref().is_some_and(|frame| {
+                    frame.get("type").and_then(Value::as_str) == Some("notice")
+                        && frame.get("level").and_then(Value::as_str) == Some("error")
+                        && frame.get("source").and_then(Value::as_str)
+                            == Some("session-persistence")
+                }) {
+                    return Err(protocol_error("OMP session persistence failed"));
+                }
+                Ok(frame)
+            }
             Ok(ProcessEvent::StdoutError(error)) => Err(HarnessServerError::Io(error)),
             Ok(ProcessEvent::Eof) => {
                 if let Some(status) = self.process.try_wait()? {

@@ -1,0 +1,66 @@
+# Using the OMP Harness
+
+Centaur can run [oh-my-pi](https://github.com/can1357/oh-my-pi) (OMP) as a
+first-class session harness alongside Codex, Claude Code, Amp, Nanocodex, and
+Hermes. Start an allowlisted Slack, GitHub, or Linear thread with `--omp`; the
+sandbox runs a long-lived `omp --mode rpc` process for that Centaur thread.
+
+## What makes OMP different from the other harnesses
+
+OMP's RPC process is stateful and bidirectional. Centaur therefore keeps one
+process and one OMP session per active thread instead of spawning a CLI per
+turn.
+
+- **Correlated RPC** — setup, prompts, steering, and aborts have request ids;
+  events can arrive before a prompt acknowledgement or out of command order.
+- **Durable session mapping** — Centaur stores the OMP session id and session
+  file under the configured state root. A resumed thread must prove that both
+  still match; it never scans or adopts an arbitrary session file.
+- **Protocol v2 frames** — Centaur negotiates OMP RPC v2 and strictly validates
+  chunk order, byte counts, JSON, and configured frame bounds before mapping
+  output to Centaur's app-server events.
+- **Graceful control** — a steer is appended to the active turn and an
+  interrupt sends OMP `abort` before the process is reaped as a deadline
+  fallback. A prompt acknowledgement is not treated as turn completion.
+- **Fail-closed host callbacks** — the `centaur-safe` profile exposes no host
+  tools or URI schemes. Host tool, URI, and interactive UI requests are denied;
+  presentation-only UI updates are ignored.
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `CENTAUR_OMP_ENABLED` | Must be `1` in both the control plane and sandbox before OMP can run. |
+| `CENTAUR_OMP_THREAD_ALLOWLIST` | Comma-separated thread keys permitted to create OMP sessions. The control plane rejects every other thread. |
+| `CENTAUR_OMP_ALLOWED_MODELS` | Required comma-separated OMP `provider/model` pairs. The sandbox verifies the selected and effective model against it. |
+| `CENTAUR_OMP_BIN` | Operator-owned `omp` executable path; defaults to `omp` on `PATH`. Absolute overrides are canonicalized and must be executable. |
+| `CENTAUR_OMP_SESSION_ROOT` | Absolute root for OMP session files and Centaur mappings; defaults to `/home/agent/.omp/centaur-sessions`. |
+| `OMP_AUTH_MODE` | Optional auth-mode selection used when the API control plane registers the OMP credential proxy fragment. |
+
+The sandbox image pins `@oh-my-pi/pi-coding-agent` and verifies
+`omp/18.3.0` before starting it. The built-in `centaur-safe` profile limits the
+model-visible local tool surface to `bash`, `edit`, `glob`, `grep`, `lsp`,
+`read`, `task`, `todo`, and `write`; startup reads OMP state and fails if the
+effective tool set or queue/interrupt modes differ.
+
+## Selecting OMP
+
+Use `--omp` as the harness selector. A model override is permitted only when
+it exactly matches an operator allowlisted `provider/model` pair:
+
+```text
+--omp --model=provider/model inspect this change
+```
+
+OMP is disabled by default and does not change Centaur's default harness.
+Existing OMP sessions retain their harness identity across turns; switching a
+thread to another harness follows Centaur's normal restart policy.
+
+## Rollback
+
+Disable `CENTAUR_OMP_ENABLED` or remove a thread from
+`CENTAUR_OMP_THREAD_ALLOWLIST` to stop new OMP selection. Preserve session
+files and mappings: reopening them with a different OMP version is not safe.
+The database migration accepts the `omp` harness type, so rolling back that
+constraint is only safe after all OMP session rows are gone; Centaur never
+rewrites them to another harness.

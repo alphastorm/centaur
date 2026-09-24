@@ -45,10 +45,10 @@ impl Bridge {
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                if let Ok(value) = serde_json::from_str(&line) {
-                    if tx.send(value).is_err() {
-                        break;
-                    }
+                if let Ok(value) = serde_json::from_str(&line)
+                    && tx.send(value).is_err()
+                {
+                    break;
                 }
             }
         });
@@ -185,15 +185,13 @@ fn fake_omp_jsonrpc_errors_are_correlated_and_nonfatal() {
         Some("OMP request failed")
     );
 
-    bridge.send(json!({"id": 3, "method": "initialize", "params": {}}));
-    let recovered = bridge.recv_until(|value| value.get("id") == Some(&json!(3)));
+    let thread_id = bridge.initialize_and_start();
+    let (_, recovered) = bridge.start_turn(3, &thread_id, "after invalid request");
     assert_eq!(
-        recovered
-            .last()
-            .unwrap()
-            .pointer("/result/userAgent")
+        completed(&recovered)
+            .pointer("/params/turn/status")
             .and_then(Value::as_str),
-        Some("harness-server omp/17.1.3")
+        Some("completed")
     );
 }
 
@@ -430,6 +428,28 @@ fn fake_omp_fails_closed_on_malformed_stdout_then_lazily_restarts_and_resumes() 
             .and_then(Value::as_str),
         Some("completed")
     );
+}
+
+#[test]
+fn fake_omp_handles_new_ui_metadata_and_fails_on_persistence_loss() {
+    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
+    let thread_id = bridge.initialize_and_start();
+    let (_, selected) = bridge.start_turn(3, &thread_id, "__ui_select__");
+    assert_eq!(
+        completed(&selected).pointer("/params/turn/status"),
+        Some(&json!("completed"))
+    );
+    let (_, failed) = bridge.start_turn(4, &thread_id, "__persistence_error__");
+    assert_eq!(
+        completed(&failed).pointer("/params/turn/status"),
+        Some(&json!("failed"))
+    );
+    let error = completed(&failed)
+        .pointer("/params/turn/error/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(error.contains("session persistence failed"));
+    assert!(!error.contains("private-store-path"));
 }
 
 #[test]

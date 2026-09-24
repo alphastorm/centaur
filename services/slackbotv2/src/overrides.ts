@@ -253,14 +253,14 @@ export function validateStrategyOverrides(
   const harnessRaw = cleanString(raw.harness)
   if (harnessRaw) {
     const normalized = harnessRaw.toLowerCase()
-    if (!STRATEGY_HARNESSES[normalized]) return {}
+    if (!STRATEGY_HARNESSES.has(normalized)) return {}
     harnessType = normalized
   }
 
   const providerRaw = cleanString(raw.provider)
   if (providerRaw) {
     const normalized = providerRaw.toLowerCase()
-    if (!STRATEGY_PROVIDERS[normalized]) return {}
+    if (!STRATEGY_PROVIDERS.has(normalized)) return {}
     provider = normalized
     if (harnessType && harnessType !== 'codex') return {}
     harnessType = 'codex'

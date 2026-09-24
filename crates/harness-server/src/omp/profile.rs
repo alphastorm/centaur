@@ -11,7 +11,7 @@ use crate::omp::protocol::protocol_error;
 use crate::{HarnessServerError, Result};
 
 pub(crate) const PROFILE_ID: &str = "centaur-safe";
-pub(crate) const OMP_VERSION: &str = "17.1.3";
+pub(crate) const OMP_VERSION: &str = "18.3.0";
 pub(crate) const SAFE_TOOLS: &[&str] = &[
     "bash", "edit", "glob", "grep", "lsp", "read", "task", "todo", "write",
 ];

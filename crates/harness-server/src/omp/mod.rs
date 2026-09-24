@@ -546,8 +546,9 @@ fn run_normalized_turn<W: Write>(
         |event| {
             telemetry.observe_normalized(&event);
             for notification in normalizer.borrow_mut().process_event(&event)? {
-                telemetry.observe_notification(&notification);
-                write_notification(&mut **output.borrow_mut(), &notification)?;
+                let value = notification_to_wire_value(&notification)?;
+                telemetry.observe_tool_notification(&value);
+                write_value(&mut **output.borrow_mut(), &value)?;
             }
             Ok(())
         },

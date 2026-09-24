@@ -83,10 +83,7 @@ impl StatefulProcess {
         thread::spawn(move || {
             let mut stderr = stderr;
             let mut chunk = [0_u8; 1024];
-            loop {
-                let Ok(read) = stderr.read(&mut chunk) else {
-                    break;
-                };
+            while let Ok(read) = stderr.read(&mut chunk) {
                 if read == 0 {
                     break;
                 }

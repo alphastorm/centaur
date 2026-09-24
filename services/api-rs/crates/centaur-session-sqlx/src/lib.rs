@@ -2236,7 +2236,13 @@ mod tests {
         };
         let thread_key = ThreadKey::parse(format!("test:omp-{}", Uuid::new_v4())).unwrap();
         let session = store
-            .create_or_get_session(&thread_key, &HarnessType::Omp, None, json!({}))
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Omp,
+                None,
+                json!({}),
+                BTreeMap::new(),
+            )
             .await
             .expect("create OMP session");
 

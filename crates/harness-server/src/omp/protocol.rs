@@ -231,6 +231,21 @@ pub(crate) fn frame_type(value: &Value) -> Result<&str> {
         .ok_or_else(|| protocol_error("OMP frame is missing string type"))
 }
 
+/// OMP 18.3 emits these notifications between correlated setup responses.
+/// They are not turn events or requests for host authority.
+pub(crate) fn is_state_notification(kind: &str) -> bool {
+    matches!(
+        kind,
+        "available_commands_update"
+            | "config_update"
+            | "session_info_update"
+            | "thinking_level_changed"
+            | "model_changed"
+            | "config_warnings_changed"
+            | "advisor_cost_changed"
+    )
+}
+
 pub(crate) fn protocol_error(message: impl Into<String>) -> HarnessServerError {
     HarnessServerError::Protocol(format!("OMP protocol error: {}", message.into()))
 }

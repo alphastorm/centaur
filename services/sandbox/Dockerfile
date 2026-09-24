@@ -226,7 +226,7 @@ COPY --link --chown=1001:1001 services/sandbox/omp-package/package.json services
 RUN --mount=type=cache,target=/home/agent/.bun/install/cache,uid=1001,gid=1001,sharing=locked \
     bun install --cwd /home/agent/.local/share/centaur-omp --frozen-lockfile --production \
     && ln -s /home/agent/.local/share/centaur-omp/node_modules/.bin/omp /home/agent/.bun/bin/omp \
-    && omp --version | grep -Fx "omp/17.1.3"
+    && omp --version | grep -Fx "omp/18.3.0"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
     && manim --version
