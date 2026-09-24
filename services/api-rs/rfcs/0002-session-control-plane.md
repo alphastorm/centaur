@@ -93,8 +93,8 @@ Field notes:
 - `sandbox_id` is the current runtime assignment. It is nullable before the
   first execution and can be overwritten when the control plane replaces a dead
   sandbox.
-- `harness_type` selects the harness adapter: `amp`, `claudecode`, `codex`, or
-  the rollout-gated `omp`.
+- `harness_type` selects the harness adapter, for example `amp`,
+  `claude-code`, or `codex`.
 - `harness_thread_id` is the harness-native conversation identifier when the
   harness exposes one. It is nullable until the first harness turn returns it.
 

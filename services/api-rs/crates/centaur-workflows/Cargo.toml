@@ -30,9 +30,5 @@ tokio = { workspace = true, features = ["io-util", "process"] }
 tracing.workspace = true
 uuid.workspace = true
 
-[dev-dependencies]
-async-trait.workspace = true
-centaur-sandbox-local.workspace = true
-
 [lints]
 workspace = true
