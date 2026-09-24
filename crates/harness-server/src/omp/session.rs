@@ -106,6 +106,7 @@ impl OmpSession {
         if !images.is_empty() {
             prompt["images"] = Value::Array(images);
         }
+        self.normalizer.begin_turn();
         self.process.write_json(&prompt)?;
 
         let started = Instant::now();
@@ -154,7 +155,11 @@ impl OmpSession {
                 if let Some(error) = turn_error {
                     return Err(protocol_error(error));
                 }
-                emit(NormalizedEvent::Result { error: None })?;
+                let error = self
+                    .normalizer
+                    .take_assistant_error()
+                    .filter(|_| !interrupted);
+                emit(NormalizedEvent::Result { error })?;
                 return Ok(TurnOutcome { interrupted, usage });
             }
             if interrupted && abort_deadline.is_some_and(|deadline| Instant::now() >= deadline) {

@@ -51,6 +51,9 @@ turn.
   fallback. A prompt acknowledgement is not treated as turn completion.
   A non-retry OMP error first aborts the child turn (with the same forced-stop
   fallback); only then is failure emitted to the session runtime.
+  A provider failure that OMP does not retry ends its agent with an errored
+  assistant message; Centaur fails that turn with the provider's error line.
+  OMP's automatic retries continue the same turn.
   `command_output.text` is a final result only for a local-only prompt
   (`agentInvoked=false`). Otherwise it is command/tool output, so interrupting
   after command output alone remains cancelled rather than becoming success.

@@ -371,6 +371,38 @@ fn fake_omp_error_ends_child_turn_before_failure() {
 }
 
 #[test]
+fn fake_omp_provider_error_fails_turn_then_thread_continues() {
+    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
+    let thread_id = bridge.initialize_and_start();
+    let (_, failed) = bridge.start_turn(3, &thread_id, "__provider_error__");
+    let turn = completed(&failed).pointer("/params/turn").unwrap();
+    assert_eq!(turn.pointer("/status"), Some(&json!("failed")));
+    let error = turn
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert!(error.contains("fake provider rejection"), "{error}");
+    assert!(!error.contains("raw-http-request"), "{error}");
+    let (_, next) = bridge.start_turn(4, &thread_id, "after provider error");
+    assert_eq!(
+        completed(&next).pointer("/params/turn/status"),
+        Some(&json!("completed"))
+    );
+}
+
+#[test]
+fn fake_omp_retried_provider_error_completes_with_retry_answer() {
+    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
+    let thread_id = bridge.initialize_and_start();
+    let (_, values) = bridge.start_turn(3, &thread_id, "__retried_provider_error__");
+    assert_eq!(
+        completed(&values).pointer("/params/turn/status"),
+        Some(&json!("completed"))
+    );
+    assert_eq!(deltas(&values), vec!["recovered after retry"]);
+}
+
+#[test]
 fn fake_omp_forced_abort_restarts_and_resumes_before_next_turn() {
     let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
     let thread_id = bridge.initialize_and_start();

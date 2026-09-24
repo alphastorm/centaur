@@ -15,9 +15,22 @@ pub(crate) struct OmpEventNormalizer {
     command_output_index: usize,
     assistant_message_index: usize,
     active_assistant_item: Option<String>,
+    /// A provider failure ends OMP's agent normally with an assistant message
+    /// whose `stopReason` is `error`; an automatic retry supersedes it with a
+    /// new assistant message.
+    assistant_error: Option<String>,
 }
 
 impl OmpEventNormalizer {
+    pub(crate) fn begin_turn(&mut self) {
+        self.active_assistant_item = None;
+        self.assistant_error = None;
+    }
+
+    pub(crate) fn take_assistant_error(&mut self) -> Option<String> {
+        self.assistant_error.take()
+    }
+
     pub(crate) fn normalize(&mut self, frame: &Value) -> Result<Vec<NormalizedEvent>> {
         let kind = frame_type(frame)?;
         let mut events = Vec::new();
@@ -28,6 +41,7 @@ impl OmpEventNormalizer {
                     self.assistant_message_index += 1;
                     let item_id = format!("omp-assistant-{}", self.assistant_message_index);
                     self.active_assistant_item = Some(item_id.clone());
+                    self.assistant_error = None;
                     events.push(NormalizedEvent::AgentMessageStarted {
                         item_id,
                         stop_reason: None,
@@ -91,6 +105,9 @@ impl OmpEventNormalizer {
                     }
                     if let Some(usage) = normalized_usage(message) {
                         events.push(NormalizedEvent::TokenUsage { usage });
+                    }
+                    if message.get("stopReason").and_then(Value::as_str) == Some("error") {
+                        self.assistant_error = Some(assistant_error_summary(message));
                     }
                 }
             }
@@ -224,6 +241,18 @@ impl OmpEventNormalizer {
 fn assistant_message(frame: &Value) -> Option<&serde_json::Map<String, Value>> {
     let message = frame.get("message")?.as_object()?;
     (message.get("role").and_then(Value::as_str) == Some("assistant")).then_some(message)
+}
+
+/// OMP appends local diagnostics (such as its raw request log path) after the
+/// provider error on later lines; surface only the provider's first line.
+fn assistant_error_summary(message: &serde_json::Map<String, Value>) -> String {
+    message
+        .get("errorMessage")
+        .and_then(Value::as_str)
+        .and_then(|error| error.lines().next())
+        .filter(|line| !line.trim().is_empty())
+        .map(bounded_text)
+        .unwrap_or_else(|| "OMP assistant message failed".to_string())
 }
 
 fn normalized_content(

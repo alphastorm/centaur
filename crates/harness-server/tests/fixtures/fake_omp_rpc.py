@@ -176,6 +176,31 @@ def delayed_normal(text: str, *, delay: float = 0.01, **kwargs: Any) -> None:
     assistant_events(text, **kwargs)
 
 
+def provider_error_events(*, retried: bool) -> None:
+    """Mirror omp 18.3.0: a provider failure ends the agent with an errored message."""
+    global last_assistant_text
+    time.sleep(0.01)
+    emit({"type": "turn_start"})
+    emit({"type": "message_start", "message": {"role": "assistant", "responseId": "msg-error"}})
+    emit({"type": "message_end", "message": {
+        "role": "assistant", "responseId": "msg-error", "content": [], "stopReason": "error",
+        "errorStatus": 400,
+        "errorMessage": '400 {"type": "error", "error": {"type": "invalid_request_error", '
+                        '"message": "fake provider rejection"}}\n'
+                        "raw-http-request=/private/omp-logs/raw-request.json",
+        "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+    }})
+    emit({"type": "turn_end", "message": {}, "toolResults": []})
+    if not retried:
+        last_assistant_text = ""
+        emit({"type": "agent_end", "isTerminal": True, "messages": [], "reason": "error"})
+        return
+    emit({"type": "agent_end", "isTerminal": False, "messages": [], "reason": "retry"})
+    emit({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 0,
+          "errorMessage": "fake overloaded"})
+    assistant_events("recovered after retry")
+
+
 def wait_for_abort() -> None:
     global last_assistant_text
     emit({"type": "agent_start"})
@@ -264,6 +289,10 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
         emit({"type": "message_update", "message": {"role": "assistant", "responseId": "unknown"},
               "assistantMessageEvent": {"type": "unknown_delta"}})
         emit({"type": "agent_end", "isTerminal": True, "messages": []})
+    elif "__provider_error__" in message or "__retried_provider_error__" in message:
+        threading.Thread(target=provider_error_events,
+                         kwargs={"retried": "__retried_provider_error__" in message},
+                         daemon=True).start()
     elif "__command_then_abort__" in message:
         abort_event.clear()
         emit({"type": "command_output", "id": request_id, "command": "/fake",
