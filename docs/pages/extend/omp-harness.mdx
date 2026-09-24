@@ -1,135 +1,66 @@
 # Using the OMP Harness
 
 Centaur can run [oh-my-pi](https://github.com/can1357/oh-my-pi) (OMP) as a
-first-class session harness alongside Codex, Claude Code, Amp, Nanocodex, and
-Hermes. Start an allowlisted Slack, GitHub, or Linear thread with `--omp`; the
-sandbox runs a long-lived `omp --mode rpc` process for that Centaur thread.
+session harness alongside Codex, Claude Code, Amp, Nanocodex, and Hermes.
+Start a Slack, GitHub, or Linear thread with `--omp` (or set `omp` as a channel
+or deployment default) and the sandbox runs a long-lived `omp --mode rpc`
+process for that thread instead of a spawn-per-turn CLI.
 
-## What makes OMP different from the other harnesses
+## How the integration works
 
-OMP's RPC process is stateful and bidirectional. Centaur therefore keeps one
-process and one OMP session per active thread instead of spawning a CLI per
-turn.
-
-- **Correlated RPC** — setup, prompts, steering, and aborts have request ids;
-  events can arrive before a prompt acknowledgement or out of command order.
-  Pending control acknowledgements survive turn boundaries, including model
-  changes between turns. Unknown ids and more than 1,024 pending controls fail
-  closed rather than being accepted or retained without a bound.
-  OMP 18.3 terminal events have no prompt id: Centaur requires the active
-  agent lifecycle and a correlated `get_state` response confirming it is no
-  longer streaming before settling. Duplicate terminals before the next agent
-  starts and stale terminals while it is streaming are consumed, not applied
-  to the new turn.
-- **Durable session mapping** — Centaur stores the OMP session id and session
-  file under the configured state root. A resumed thread must prove that both
-  still match; it never scans or adopts an arbitrary session file.
-  Mapping filenames are the SHA-256 of the complete thread key, so 512-byte
-  keys and keys sharing a long prefix remain distinct without exceeding
-  filesystem filename limits. The full key is retained inside the mapping and
-  checked on every load.
-  Production blocks mode uses the sandbox's stable `CENTAUR_THREAD_KEY` to
-  recover that mapping after restart. Keep the state root on persistent storage;
-  a fresh state root has no history to resume. Direct blocks invocations without
-  a thread key create a new thread.
-  When a persistent state volume is mounted, the entrypoint relocates `~/.omp`
-  under that volume alongside the other harness state. `stateVolume.enabled`
-  is false by default: without retained storage, replacing a sandbox starts a
-  new OMP session, even though harness-process restarts retain its history.
-  The configured root is canonicalized once: the entrypoint's `~/.omp` symlink
-  and session paths through it are supported, but symlinks inside the canonical
-  session root (including the mappings directory) are refused.
-- **Protocol v2 frames** — Centaur negotiates OMP RPC v2 and strictly validates
-  chunk order, byte counts, JSON, and configured frame bounds before mapping
-  output to Centaur's app-server events.
-  Unknown event kinds or assistant-update kinds, and missing or non-boolean
-  `agent_end.isTerminal`, fail the turn closed. Known presentation-only events
-  remain accepted. Only accepted frames refresh the idle watchdog; the
-  30-second command deadline is absolute across all chunks of a response.
-- **Graceful control** — a steer is appended to the active turn and an
-  interrupt sends OMP `abort` before the process is reaped as a deadline
-  fallback. A prompt acknowledgement is not treated as turn completion.
-  A non-retry OMP error first aborts the child turn (with the same forced-stop
-  fallback); only then is failure emitted to the session runtime.
-  A provider failure that OMP does not retry ends its agent with an errored
-  assistant message; Centaur fails that turn with the provider's error line.
-  OMP's automatic retries continue the same turn.
-  `command_output.text` is a final result only for a local-only prompt
-  (`agentInvoked=false`). Otherwise it is command/tool output, so interrupting
-  after command output alone remains cancelled rather than becoming success.
-  User messages received during an active blocks turn steer that same turn.
-  After a forced abort, child exit, or malformed output, the next turn starts a
-  fresh child and resumes the validated mapping instead of losing a turn or
-  silently creating another OMP session.
-- **Fail-closed host callbacks** — the `centaur-safe` profile exposes no host
-  tools or URI schemes. Host tool, URI, and interactive UI requests are denied;
-  presentation-only UI updates are ignored.
+- **One OMP process per thread** — `harness-server omp` speaks OMP's RPC
+  protocol over stdio and keeps the process alive across turns. Steering
+  appends to the active turn; an interrupt sends OMP `abort` and only kills
+  the process if the turn does not end within the grace period.
+- **Native session resume** — each thread gets its own OMP session directory,
+  `$CENTAUR_OMP_SESSION_ROOT/<sha256(thread key)>`, and OMP starts with
+  `--session-dir <dir> --continue`. If the OMP process exits, the next turn
+  starts it again on the same directory and OMP continues the conversation.
+  History survives a sandbox replacement only when that directory is on
+  persistent storage.
+- **Turn completion** — OMP 18.3 terminal events carry no prompt id, so a turn
+  completes only after its own `agent_start`, a terminal `agent_end`, and a
+  `get_state` response reporting that OMP is no longer streaming. Late or
+  duplicate terminal events from an earlier turn are ignored. Unknown event
+  kinds fail the turn instead of being dropped.
+- **Errors** — a provider error that OMP does not retry ends the turn as
+  failed with the provider's error line; OMP's own retries continue the turn.
+- **Host callbacks** — a sandbox has no interactive host, so OMP host tool,
+  host URI, and interactive UI requests are declined; presentation-only UI
+  updates are ignored.
 
 ## Configuration
 
 | Variable | Purpose |
 |---|---|
-| `CENTAUR_OMP_ENABLED` | Must be `1` in both the control plane and sandbox before OMP can run. |
-| `CENTAUR_OMP_THREAD_ALLOWLIST` | Comma-separated exact thread keys permitted to create or switch into OMP sessions, including workflow agent turns. |
-| `CENTAUR_OMP_ALLOWED_MODELS` | Required comma-separated `anthropic/model` pairs. Startup rejects every other provider; the sandbox verifies the selected and effective model against the list. |
-| `CENTAUR_OMP_BIN` | Operator-owned `omp` executable path; defaults to `omp` on `PATH`. Absolute overrides are canonicalized and must be executable. |
-| `CENTAUR_OMP_SESSION_ROOT` | Absolute root for OMP session files and Centaur mappings; defaults to `/home/agent/.omp/centaur-sessions`. |
-| `CENTAUR_THREAD_KEY` | Stable thread identity supplied by the session runtime for blocks-mode mapping recovery. |
-| `CLAUDE_CODE_AUTH_MODE` | Shared OMP/Claude Code proxy auth mode: `api_key` (default) or `access_token`. OMP reuses the Claude Code fragment and its sandbox auth configuration. |
+| `CENTAUR_OMP_BIN` | `omp` executable (default: `omp` on `PATH`). |
+| `CENTAUR_OMP_SESSION_ROOT` | Root for per-thread session directories (default: `~/.omp/centaur-sessions`). |
+| `CENTAUR_THREAD_KEY` | Set by the session runtime; selects the thread's session directory. Without it, `harness-server omp` starts a new thread. |
 
-The sandbox image pins `@oh-my-pi/pi-coding-agent` and verifies
-`omp/18.3.0` before starting it. The built-in `centaur-safe` profile limits the
-model-visible local tool surface to `bash`, `edit`, `glob`, `grep`, `lsp`,
-`read`, `task`, `todo`, and `write`; startup reads OMP state and fails if the
-effective tool set or queue/interrupt modes differ.
+The sandbox image installs `@oh-my-pi/pi-coding-agent` 18.3.0 from a frozen
+lockfile (which needs Bun 1.3.14 or newer) and checks the installed version at
+build time. OMP uses its stock tools and settings. When a sandbox state volume
+is mounted, the entrypoint keeps `~/.omp` on it next to the other harnesses'
+state.
 
-OMP cannot be the warm-pool harness: startup rejects
-`SESSION_SANDBOX_HARNESS=omp` with `SESSION_SANDBOX_WARM_POOL_SIZE` greater than
-zero, because warm sandboxes boot before `CENTAUR_THREAD_KEY` is known. Use a
-zero-sized pool for that default, or retain another default harness and admit
-OMP threads individually.
+OMP cannot be the warm-pool harness: api-rs refuses to start with
+`SESSION_SANDBOX_HARNESS=omp` and a nonzero `SESSION_SANDBOX_WARM_POOL_SIZE`,
+because warm sandboxes boot before their thread key is known.
 
-OMP currently reuses the Claude Code iron-proxy fragment, which covers
-`api.anthropic.com`, not every provider OMP supports. Only Anthropic models are
-admitted. Managed sandboxes receive provider credential placeholders; iron-proxy
-resolves real credentials outside the sandbox. The OMP child receives only
-the approved Anthropic placeholder and transport environment; `OPENAI_*`,
-`GEMINI_*`, `AWS_*`, and `GOOGLE_*` variables are not inherited. The shared
-Claude Code fragment is registered once, including when OMP is the primary
-proxy engine. Its API-key mode replaces `X-Api-Key`, matching OMP 18.3.0
-requests to the official Anthropic endpoint. Provider connectivity must be
-validated separately before widening an allowlist.
+## Models and credentials
 
-## Selecting OMP
-
-Use `--omp` as the harness selector. A model override is permitted only when
-it exactly matches an operator allowlisted `anthropic/model` pair:
-
-```text
---omp --model=anthropic/claude-sonnet-4-5 inspect this change
-```
-
-OMP is disabled by default and does not change Centaur's default harness.
-Existing OMP sessions retain their harness identity across turns; switching a
-thread to another harness follows Centaur's normal restart policy.
-The rollout flag and exact thread allowlist are admission gates at the shared
-session runtime boundary: HTTP creation, harness switches, workflow
-`ctx.agent_turn` overrides, and tool-host session creation all use the same
-check. When that check would refuse OMP, the runtime consults the durable
-session: an existing OMP session still loads when admission is disabled, while a
-new OMP session or a switch into OMP is refused. Disabling admission does not
-terminate an existing OMP execution or prevent an already admitted session from
-executing again. Direct operator invocation of `harness-server omp` is not
-control-plane session creation; its local profile still requires enablement
-and an allowed Anthropic model.
+Select a model with `--model provider/model`, for example
+`--omp --model anthropic/claude-sonnet-4-5`; without one, OMP uses its default.
+OMP reads provider keys from its environment the stock way. In a managed
+sandbox those variables hold placeholders, and iron-proxy swaps in the real
+credential on egress for every provider with a registered fragment: Anthropic
+through the Claude Code fragment (`CLAUDE_CODE_AUTH_MODE`), OpenAI through the
+Codex fragment, and the other fragments api-rs registers for every harness.
+Any other provider needs its own fragment or overlay, as with the other
+harnesses.
 
 ## Rollback
 
-1. Disable `CENTAUR_OMP_ENABLED` or remove the thread allowlist to stop new
-   OMP creation and switches, including workflow-created sessions.
-2. Drain or explicitly stop existing OMP executions and sessions; admission
-   disablement alone is not a kill switch.
-3. Preserve native session files, mappings, and OMP rows. Keep the matching
-   18.3.0 image available for recovery; mappings are version-specific.
-4. Keep migration `0056` applied. It is forward-only; do not relabel OMP rows or
-   deploy older readers that cannot deserialize `omp` while those rows remain.
+Migration `0056` adds `omp` to the sessions harness constraint and is
+forward-only. To stop using OMP, stop selecting it; keep the migration applied
+and keep rows with `harness_type = 'omp'` while older readers could see them.
