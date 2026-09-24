@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -6,57 +7,77 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const KEY: &str = "test-thread";
+
+struct TestRoot(PathBuf);
+
+impl TestRoot {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("centaur-omp-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        Self(root)
+    }
+
+    fn session_dir(&self, key: &str) -> PathBuf {
+        self.0.join(format!("{:x}", Sha256::digest(key.as_bytes())))
+    }
+}
+
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct Bridge {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     output: Receiver<Value>,
-    session_root: PathBuf,
+    timeout: Duration,
 }
 
 impl Bridge {
-    fn spawn(mode: &str, session_root: PathBuf) -> Self {
-        Self::spawn_with_env(mode, session_root, &[])
+    fn spawn(root: &TestRoot, key: Option<&str>, env: &[(&str, &str)]) -> Self {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_omp_rpc.py");
+        Self::with_binary(root, key, fixture.as_os_str(), env, TIMEOUT)
     }
 
-    fn spawn_with_env(mode: &str, session_root: PathBuf, env: &[(&str, &str)]) -> Self {
-        let binary = env!("CARGO_BIN_EXE_harness-server");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/fake_omp_rpc.py")
-            .canonicalize()
-            .unwrap();
-        let mut child = Command::new(binary)
-            .args(if mode == "blocks" {
-                vec!["omp"]
-            } else {
-                vec!["omp", "--mode", "jsonrpc"]
-            })
-            .env("CENTAUR_OMP_BIN", fixture)
-            .env("CENTAUR_OMP_SESSION_ROOT", &session_root)
-            .env("CENTAUR_THREAD_KEY", session_root.file_name().unwrap())
-            .env("CENTAUR_OMP_ENABLED", "1")
+    fn with_binary(
+        root: &TestRoot,
+        key: Option<&str>,
+        binary: &OsStr,
+        env: &[(&str, &str)],
+        timeout: Duration,
+    ) -> Self {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_harness-server"));
+        command
+            .arg("omp")
+            .current_dir(&root.0)
+            .env("CENTAUR_OMP_BIN", binary)
+            .env("CENTAUR_OMP_SESSION_ROOT", &root.0)
+            .env("HOME", root.0.join("home"))
+            .env_remove("CENTAUR_OMP_ENABLED")
+            .env_remove("CENTAUR_OMP_ALLOWED_MODELS")
+            .env_remove("CENTAUR_THREAD_KEY")
             .envs(env.iter().copied())
-            .env(
-                "CENTAUR_OMP_ALLOWED_MODELS",
-                "anthropic/fake-model,anthropic/fake-model-2",
-            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
+            .stderr(Stdio::inherit());
+        if let Some(key) = key {
+            command.env("CENTAUR_THREAD_KEY", key);
+        }
+        let mut child = command.spawn().unwrap();
+        let stdin = child.stdin.take();
         let stdout = child.stdout.take().unwrap();
         let (tx, output) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                if let Ok(value) = serde_json::from_str(&line)
-                    && tx.send(value).is_err()
-                {
+                let value = serde_json::from_str(&line.unwrap()).expect("JSON-only harness stdout");
+                if tx.send(value).is_err() {
                     break;
                 }
             }
@@ -65,25 +86,25 @@ impl Bridge {
             child,
             stdin,
             output,
-            session_root,
+            timeout,
         }
     }
 
     fn send(&mut self, value: Value) {
-        serde_json::to_writer(&mut self.stdin, &value).unwrap();
-        self.stdin.write_all(b"\n").unwrap();
-        self.stdin.flush().unwrap();
+        let stdin = self.stdin.as_mut().unwrap();
+        serde_json::to_writer(&mut *stdin, &value).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
     }
 
-    fn recv_until(&self, mut predicate: impl FnMut(&Value) -> bool) -> Vec<Value> {
-        let deadline = Instant::now() + TIMEOUT;
+    fn until(&self, mut predicate: impl FnMut(&Value) -> bool) -> Vec<Value> {
+        let deadline = Instant::now() + self.timeout;
         let mut values = Vec::new();
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            assert!(!remaining.is_zero(), "timed out; values={values:#?}");
-            let value = self.output.recv_timeout(remaining).unwrap_or_else(|error| {
-                panic!("bridge output ended before expected value: {error}; values={values:#?}")
-            });
+            let value = self
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| panic!("bridge ended: {error}; values={values:#?}"));
             let done = predicate(&value);
             values.push(value);
             if done {
@@ -92,975 +113,409 @@ impl Bridge {
         }
     }
 
-    fn initialize_and_start(&mut self) -> String {
-        self.send(json!({"id": 1, "method": "initialize", "params": {}}));
-        self.recv_until(|value| value.get("id") == Some(&json!(1)));
-        self.send(json!({
-            "id": 2,
-            "method": "thread/start",
-            "params": {
-                "cwd": env!("CARGO_MANIFEST_DIR"),
-                "model": "anthropic/fake-model",
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access"
-            }
-        }));
-        let values = self.recv_until(|value| value.get("id") == Some(&json!(2)));
-        values
-            .last()
-            .and_then(|value| value.pointer("/result/thread/id"))
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string()
+    fn begin(&mut self, text: &str) -> Vec<Value> {
+        self.send(json!({"type": "user", "text": text}));
+        self.until(|value| method(value) == "turn/started")
     }
 
-    fn start_turn(&mut self, request_id: u64, thread_id: &str, text: &str) -> (String, Vec<Value>) {
-        let (turn_id, mut values) = self.begin_turn(request_id, thread_id, text);
-        values.extend(self.recv_until(|value| {
-            value.get("method").and_then(Value::as_str) == Some("turn/completed")
-        }));
-        (turn_id, values)
+    fn turn(&mut self, text: &str) -> Vec<Value> {
+        self.send(json!({"type": "user", "text": text}));
+        self.finish()
     }
 
-    fn begin_turn(&mut self, request_id: u64, thread_id: &str, text: &str) -> (String, Vec<Value>) {
-        self.send(json!({
-            "id": request_id,
-            "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": text, "text_elements": []}]
-            }
-        }));
-        let values = self.recv_until(|value| value.get("id") == Some(&json!(request_id)));
-        let turn_id = values
-            .last()
-            .and_then(|value| value.pointer("/result/turn/id"))
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string();
-        (turn_id, values)
+    fn finish(&self) -> Vec<Value> {
+        self.until(|value| method(value) == "turn/completed")
     }
 }
 
 impl Drop for Bridge {
     fn drop(&mut self) {
+        self.stdin.take();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.session_root);
     }
 }
 
-fn temp_session_root() -> PathBuf {
-    std::env::temp_dir().join(format!("centaur-omp-test-{}", Uuid::new_v4()))
+fn method(value: &Value) -> &str {
+    value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn completed(values: &[Value]) -> &Value {
     values
         .iter()
-        .find(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"))
-        .expect("turn/completed notification")
+        .find(|value| method(value) == "turn/completed")
+        .expect("turn/completed")
 }
 
-fn deltas(values: &[Value]) -> Vec<&str> {
+fn status(values: &[Value]) -> &str {
+    completed(values)
+        .pointer("/params/turn/status")
+        .and_then(Value::as_str)
+        .unwrap()
+}
+
+fn deltas(values: &[Value]) -> String {
     values
         .iter()
-        .filter(|value| {
-            value.get("method").and_then(Value::as_str) == Some("item/agentMessage/delta")
-        })
+        .filter(|value| method(value) == "item/agentMessage/delta")
         .filter_map(|value| value.pointer("/params/delta").and_then(Value::as_str))
         .collect()
 }
 
-fn identity(values: &[Value]) -> (&str, &str) {
-    deltas(values)
-        .into_iter()
-        .find_map(|delta| {
-            delta
-                .strip_prefix("fake response pid=")
-                .and_then(|value| value.split_once(" session="))
-        })
-        .expect("fake child and session identity")
+fn identity(values: &[Value]) -> (String, String) {
+    let text = deltas(values);
+    let (pid, session) = text
+        .strip_prefix("fake response pid=")
+        .unwrap()
+        .split_once(" session=")
+        .unwrap();
+    (pid.to_string(), session.to_string())
 }
 
 #[test]
-fn fake_omp_unknown_turn_event_fails_closed() {
-    assert_rejected_turn_frame("__unknown_event__");
-}
-
-#[test]
-fn fake_omp_known_presentation_frames_remain_accepted() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, "__presentation__");
-    assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_eq!(deltas(&values), vec!["known presentation accepted"]);
-}
-
-#[test]
-fn fake_omp_local_result_before_acknowledgement_does_not_poison_next_prompt() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, "__local_result__");
-    assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_eq!(deltas(&values), vec!["local prompt result"]);
-    let (_, next) = bridge.start_turn(4, &thread_id, "after local result");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    identity(&next);
-}
-
-#[test]
-fn fake_omp_child_drops_non_anthropic_provider_environment() {
-    let env = [
-        ("OPENAI_API_KEY", "dummy"),
-        ("OPENAI_BASE_URL", "dummy"),
-        ("GEMINI_API_KEY", "dummy"),
-        ("AWS_ACCESS_KEY_ID", "dummy"),
-        ("AWS_SECRET_ACCESS_KEY", "dummy"),
-        ("AWS_SESSION_TOKEN", "dummy"),
-        ("AWS_REGION", "dummy"),
-        ("AWS_DEFAULT_REGION", "dummy"),
-        ("AWS_PROFILE", "dummy"),
-        ("GOOGLE_CLOUD_PROJECT", "dummy"),
-        ("GOOGLE_CLOUD_LOCATION", "dummy"),
-        ("GOOGLE_APPLICATION_CREDENTIALS", "dummy"),
-    ];
-    let mut bridge = Bridge::spawn_with_env("jsonrpc", temp_session_root(), &env);
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, "__provider_env__");
-    assert_eq!(deltas(&values), vec!["non-anthropic env:none"]);
-}
-
-#[cfg(unix)]
-#[test]
-fn fake_omp_boots_with_entrypoint_symlink_as_session_root() {
-    use std::os::unix::fs::symlink;
-    let parent = temp_session_root();
-    let state = parent.join("state/omp");
-    std::fs::create_dir_all(&state).unwrap();
-    std::fs::create_dir_all(parent.join("home")).unwrap();
-    let alias = parent.join("home/.omp");
-    symlink(&state, &alias).unwrap();
-    let mut bridge = Bridge::spawn("jsonrpc", alias);
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, "state volume alias");
-    assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    identity(&values);
+fn stock_omp_uses_native_per_thread_session_directory() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let values = bridge.turn("native directory");
+    assert_eq!(status(&values), "completed");
+    assert!(root.session_dir(KEY).is_dir());
+    let initial = identity(&values);
     drop(bridge);
-    std::fs::remove_dir_all(parent).unwrap();
+    let mut resumed = Bridge::spawn(&root, Some(KEY), &[]);
+    let next = identity(&resumed.turn("after restart"));
+    assert_ne!(initial.0, next.0);
+    assert_eq!(initial.1, next.1);
 }
 
 #[test]
-fn fake_omp_unknown_message_update_fails_closed() {
-    assert_rejected_turn_frame("__unknown_update__");
-}
-
-#[test]
-fn fake_omp_duplicate_terminal_cannot_complete_next_prompt() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    bridge.start_turn(3, &thread_id, "__duplicate_terminal__");
-    let (_, next) = bridge.start_turn(4, &thread_id, "next prompt");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
+fn stock_omp_needs_no_enablement_or_model_allowlist() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(
+        &root,
+        Some(KEY),
+        &[
+            ("CENTAUR_OMP_ENABLED", "0"),
+            ("CENTAUR_OMP_ALLOWED_MODELS", ""),
+        ],
     );
-    identity(&next);
+    assert_eq!(status(&bridge.turn("stock configuration")), "completed");
 }
 
 #[test]
-fn fake_omp_stale_terminal_cannot_complete_streaming_prompt() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, next) = bridge.start_turn(3, &thread_id, "__stale_terminal_during_turn__");
-    assert_eq!(deltas(&next), vec!["current turn after stale terminal"]);
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
+fn stock_omp_accepts_non_anthropic_models() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.send(json!({"type": "user", "text": "__model__", "model": "openai/fake-model"}));
+    assert_eq!(deltas(&bridge.finish()), "openai/fake-model");
+    bridge.send(
+        json!({"type": "user", "text": "__model__", "model": "second-model", "provider": "google"}),
     );
+    assert_eq!(deltas(&bridge.finish()), "google/second-model");
+    assert_eq!(deltas(&bridge.turn("__model__")), "google/second-model");
 }
 
 #[test]
-fn fake_omp_missing_terminal_flag_fails_closed() {
-    assert_rejected_turn_frame("__missing_terminal__");
+fn stock_omp_cli_has_no_mode_selector() {
+    let output = Command::new(env!("CARGO_BIN_EXE_harness-server"))
+        .args(["omp", "--mode", "jsonrpc", "--help"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
 }
 
 #[test]
-fn fake_omp_nonboolean_terminal_flag_fails_closed() {
-    assert_rejected_turn_frame("__nonboolean_terminal__");
+fn stock_omp_runs_with_protocol_v1_peer() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    assert_eq!(status(&bridge.turn("protocol v1")), "completed");
 }
 
-fn assert_rejected_turn_frame(prompt: &str) {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, prompt);
+#[test]
+fn stock_omp_inherits_provider_environment() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[("OPENAI_API_KEY", "dummy")]);
+    assert_eq!(deltas(&bridge.turn("__provider_env__")), "inherited");
+}
+
+#[test]
+fn native_resume_separates_long_keys_and_preserves_context() {
+    let root = TestRoot::new();
+    let a = format!("{}{}", "x".repeat(256), "a".repeat(256));
+    let b = format!("{}{}", "x".repeat(256), "b".repeat(256));
+    for (key, word) in [(&a, "ALPHA"), (&b, "BETA")] {
+        let mut bridge = Bridge::spawn(&root, Some(key), &[]);
+        assert_eq!(
+            deltas(&bridge.turn(&format!("__remember:{word}"))),
+            "remembered"
+        );
+    }
+    for (key, word) in [(&a, "ALPHA"), (&b, "BETA")] {
+        let mut bridge = Bridge::spawn(&root, Some(key), &[]);
+        assert_eq!(deltas(&bridge.turn("__recall__")), word);
+    }
+    let mut first = Bridge::spawn(&root, None, &[]);
+    first.turn("__remember:UNKEYED");
+    drop(first);
+    let mut second = Bridge::spawn(&root, None, &[]);
+    assert_eq!(deltas(&second.turn("__recall__")), "forgotten");
+}
+
+#[test]
+fn fake_omp_rejects_malformed_frames_then_resumes() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.turn("__remember:CONTEXT");
+    for prompt in [
+        "__unknown_event__",
+        "__unknown_update__",
+        "__missing_terminal__",
+        "__nonboolean_terminal__",
+        "__unknown_control__",
+        "__late_error__",
+        "__malformed__",
+        "__oversize__",
+    ] {
+        assert_eq!(status(&bridge.turn(prompt)), "failed", "{prompt}");
+        assert_eq!(deltas(&bridge.turn("__recall__")), "CONTEXT", "{prompt}");
+    }
+}
+
+#[test]
+fn fake_omp_ignores_stale_terminals_and_accepts_known_presentations() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.turn("__duplicate_terminal__");
+    assert_eq!(status(&bridge.turn("after duplicate")), "completed");
     assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("failed"))
+        deltas(&bridge.turn("__stale_terminal_during_turn__")),
+        "current turn after stale terminal"
     );
+    assert_eq!(
+        deltas(&bridge.turn("__presentation__")),
+        "known presentation accepted"
+    );
+    assert_eq!(
+        deltas(&bridge.turn("__nonterminal__")),
+        "nonterminal continued"
+    );
+    assert_eq!(deltas(&bridge.turn("__early__")), "early event retained");
+}
+
+#[test]
+fn fake_omp_local_results_do_not_poison_the_next_turn() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    for prompt in ["__local__", "__local_result__"] {
+        assert_eq!(deltas(&bridge.turn(prompt)), "local command completed");
+        let next = bridge.turn("after local result");
+        assert_eq!(status(&next), "completed");
+        identity(&next);
+    }
 }
 
 #[test]
 fn fake_omp_command_output_before_interrupt_is_not_a_final_answer() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (turn_id, mut values) = bridge.begin_turn(3, &thread_id, "__command_then_abort__");
-    values.extend(
-        bridge.recv_until(|value| {
-            value.get("method").and_then(Value::as_str) == Some("item/completed")
-        }),
-    );
-    bridge.send(json!({
-        "id": 4, "method": "turn/interrupt",
-        "params": {"threadId": thread_id, "turnId": turn_id}
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let mut values = bridge.begin("__command_then_abort__");
+    values.extend(bridge.until(|value| {
+        method(value) == "item/completed"
+            && value.pointer("/params/item/type") == Some(&json!("dynamicToolCall"))
     }));
-    values.extend(
-        bridge.recv_until(|value| {
-            value.get("method").and_then(Value::as_str) == Some("turn/completed")
-        }),
-    );
-    assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("interrupted"))
-    );
+    bridge.send(json!({"type": "interrupt"}));
+    values.extend(bridge.finish());
+    assert_eq!(status(&values), "interrupted");
+    assert_eq!(deltas(&values), "");
     assert!(
-        deltas(&values).is_empty(),
-        "command output must not become result text"
-    );
-    assert!(values.iter().any(|value| {
-        value.pointer("/params/item/type") == Some(&json!("dynamicToolCall"))
-            && value.pointer("/params/item/contentItems/0/text")
-                == Some(&json!("command output before abort"))
-    }));
-}
-
-#[test]
-fn fake_omp_error_ends_child_turn_before_failure() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    bridge.begin_turn(3, &thread_id, "__error_keeps_running__");
-    let mut failed =
-        bridge.recv_until(|value| value.get("method").and_then(Value::as_str) == Some("error"));
-    assert!(bridge.session_root.join("error-turn-aborted").exists());
-    failed.extend(
-        bridge.recv_until(|value| {
-            value.get("method").and_then(Value::as_str) == Some("turn/completed")
-        }),
-    );
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-    let (_, next) = bridge.start_turn(4, &thread_id, "after failed child turn");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    identity(&next);
-}
-
-#[test]
-fn fake_omp_provider_error_fails_turn_then_thread_continues() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, failed) = bridge.start_turn(3, &thread_id, "__provider_error__");
-    let turn = completed(&failed).pointer("/params/turn").unwrap();
-    assert_eq!(turn.pointer("/status"), Some(&json!("failed")));
-    let error = turn
-        .pointer("/error/message")
-        .and_then(Value::as_str)
-        .unwrap();
-    assert!(error.contains("fake provider rejection"), "{error}");
-    assert!(!error.contains("raw-http-request"), "{error}");
-    let (_, next) = bridge.start_turn(4, &thread_id, "after provider error");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
+        values
+            .iter()
+            .any(|value| value.pointer("/params/item/contentItems/0/text")
+                == Some(&json!("command output before abort")))
     );
 }
 
 #[test]
-fn fake_omp_retried_provider_error_completes_with_retry_answer() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, values) = bridge.start_turn(3, &thread_id, "__retried_provider_error__");
-    assert_eq!(
-        completed(&values).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_eq!(deltas(&values), vec!["recovered after retry"]);
-}
-
-/// Replays turns captured verbatim from omp 18.3.0 (a loopback Anthropic mock,
-/// scrubbed of local paths) so the harness is exercised against real wire
-/// shapes rather than only hand-written frames.
-#[test]
-fn fake_omp_replays_captured_omp_18_3_turns() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let status = |values: &[Value]| {
-        completed(values)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_owned()
-    };
-    let error = |values: &[Value]| {
-        completed(values)
-            .pointer("/params/turn/error/message")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_owned()
-    };
-
-    let (_, text) = bridge.start_turn(3, &thread_id, "__replay:text");
-    assert_eq!(status(&text), "completed");
-    assert_eq!(deltas(&text).concat(), "PONG-1");
-
-    let (_, tool) = bridge.start_turn(4, &thread_id, "__replay:tool");
-    assert_eq!(status(&tool), "completed");
-    for method in ["item/started", "item/completed"] {
-        assert!(tool.iter().any(|value| {
-            value.get("method").and_then(Value::as_str) == Some(method)
-                && value.pointer("/params/item/tool").and_then(Value::as_str) == Some("bash")
-        }));
+fn fake_omp_aborts_before_failure_and_denies_host_callbacks() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.begin("__error_keeps_running__");
+    bridge.until(|value| method(value) == "error");
+    assert!(root.session_dir(KEY).join("error-turn-aborted").exists());
+    assert_eq!(status(&bridge.finish()), "failed");
+    for prompt in [
+        "__notice_error__",
+        "__retry_error__",
+        "__extension_error__",
+        "__persistence_error__",
+    ] {
+        let values = bridge.turn(prompt);
+        assert_eq!(status(&values), "failed");
+        assert!(
+            !completed(&values)
+                .to_string()
+                .contains("private-store-path")
+        );
     }
-    assert_eq!(deltas(&tool).concat(), "PONG-2");
-
-    let (_, rejected) = bridge.start_turn(5, &thread_id, "__replay:provider_error");
-    assert_eq!(status(&rejected), "failed");
-    let message = error(&rejected);
-    assert!(message.contains("Tracer non-retryable error"), "{message}");
-    assert!(!message.contains("raw-http-request"), "{message}");
-
-    let (_, truncated) = bridge.start_turn(6, &thread_id, "__replay:truncated_stream");
-    assert_eq!(status(&truncated), "failed");
-    assert!(error(&truncated).contains("stream ended before message_stop"));
-
-    let (_, recovered) = bridge.start_turn(7, &thread_id, "__replay:text");
-    assert_eq!(status(&recovered), "completed");
-    assert_eq!(deltas(&recovered).concat(), "PONG-1");
+    for prompt in ["__ui__", "__ui_select__", "__host_tool__", "__host_uri__"] {
+        assert_eq!(status(&bridge.turn(prompt)), "completed", "{prompt}");
+    }
 }
 
 #[test]
-fn fake_omp_forced_abort_restarts_and_resumes_before_next_turn() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, initial) = bridge.start_turn(3, &thread_id, "before forced abort");
-    let (turn_id, _) = bridge.begin_turn(4, &thread_id, "__ignore_abort__");
-    let started = Instant::now();
-    bridge.send(json!({
-        "id": 5, "method": "turn/interrupt",
-        "params": {"threadId": thread_id, "turnId": turn_id}
-    }));
-    let interrupted = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&interrupted).pointer("/params/turn/status"),
-        Some(&json!("interrupted"))
-    );
-    assert!(started.elapsed() >= Duration::from_secs(5));
-    let (_, next) = bridge.start_turn(6, &thread_id, "after forced abort");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_ne!(identity(&initial).0, identity(&next).0);
-    assert_eq!(identity(&initial).1, identity(&next).1);
-}
-
-#[test]
-fn fake_omp_jsonrpc_errors_are_correlated_and_nonfatal() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    bridge.send(json!({"id": 1, "method": "initialize", "params": {}}));
-    bridge.recv_until(|value| value.get("id") == Some(&json!(1)));
-    bridge.send(json!({
-        "id": 2,
-        "method": "thread/start",
-        "params": {"cwd": 42}
-    }));
-    let failure = bridge.recv_until(|value| value.get("id") == Some(&json!(2)));
-    assert_eq!(
-        failure
-            .last()
-            .unwrap()
-            .pointer("/error/code")
-            .and_then(Value::as_i64),
-        Some(-32000)
-    );
-    assert_eq!(
-        failure
-            .last()
-            .unwrap()
-            .pointer("/error/message")
-            .and_then(Value::as_str),
-        Some("OMP request failed")
-    );
-
-    let thread_id = bridge.initialize_and_start();
-    let (_, recovered) = bridge.start_turn(3, &thread_id, "after invalid request");
-    assert_eq!(
-        completed(&recovered)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-}
-
-fn late_control_response(control: &str, change_model: bool) {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, initial) = bridge.start_turn(3, &thread_id, "before late response");
-    let (turn_id, _) = bridge.begin_turn(4, &thread_id, &format!("__late_{control}__"));
-    bridge.send(if control == "abort" {
-        json!({"id": 5, "method": "turn/interrupt",
-            "params": {"threadId": thread_id, "turnId": turn_id}})
-    } else {
-        json!({"id": 5, "method": "turn/steer",
-            "params": {"threadId": thread_id, "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": "steer", "text_elements": []}]}})
-    });
-    let ended = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&ended).pointer("/params/turn/status"),
-        Some(&json!(if control == "abort" {
-            "interrupted"
+fn fake_omp_steers_and_consumes_late_control_responses() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let initial = identity(&bridge.turn("before controls"));
+    for prompt in ["__out_of_order__", "__late_steer__", "__late_abort__"] {
+        let mut values = bridge.begin(prompt);
+        if prompt == "__late_abort__" {
+            bridge.send(json!({"type": "interrupt"}));
         } else {
-            "completed"
-        }))
-    );
-    if change_model {
-        bridge.send(json!({
-            "id": 6, "method": "thread/resume",
-            "params": {"threadId": thread_id, "model": "fake-model-2", "modelProvider": "anthropic"}
-        }));
-        let resumed = bridge.recv_until(|value| value.get("id") == Some(&json!(6)));
-        assert_eq!(
-            resumed.last().unwrap().pointer("/result/model"),
-            Some(&json!("fake-model-2"))
-        );
-    }
-    let (_, next) = bridge.start_turn(7, &thread_id, "after late response");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_eq!(identity(&initial), identity(&next));
-}
-
-#[test]
-fn fake_omp_late_abort_response_does_not_poison_next_turn() {
-    late_control_response("abort", false);
-}
-
-#[test]
-fn fake_omp_late_steer_response_does_not_poison_next_turn() {
-    late_control_response("steer", false);
-}
-
-#[test]
-fn fake_omp_late_control_responses_are_consumed_between_turns() {
-    late_control_response("abort", true);
-    late_control_response("steer", true);
-}
-
-#[test]
-fn fake_omp_unknown_control_response_fails_closed() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, failed) = bridge.start_turn(3, &thread_id, "__unknown_control__");
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-    assert!(
-        completed(&failed)
-            .pointer("/params/turn/error/message")
-            .and_then(Value::as_str)
-            .unwrap()
-            .contains("unknown active-turn id")
-    );
-}
-
-#[test]
-fn fake_omp_turn_setup_error_emits_failed_terminal() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    bridge.send(json!({
-        "id": 3, "method": "thread/resume",
-        "params": {"threadId": thread_id, "model": "not-allowlisted", "modelProvider": "anthropic"}
-    }));
-    let rejected = bridge.recv_until(|value| value.get("id") == Some(&json!(3)));
-    assert!(rejected.last().unwrap().get("error").is_some());
-    let (_, failed) = bridge.start_turn(4, &thread_id, "after failed setup");
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-}
-
-#[test]
-fn fake_omp_bounds_pending_control_responses() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (turn_id, _) = bridge.begin_turn(3, &thread_id, "__silent_controls__");
-    for id in 4..1029 {
-        bridge.send(json!({
-            "id": id, "method": "turn/steer",
-            "params": {"threadId": thread_id, "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": "steer", "text_elements": []}]}
-        }));
-    }
-    let failed = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-    assert!(
-        completed(&failed)
-            .pointer("/params/turn/error/message")
-            .and_then(Value::as_str)
-            .unwrap()
-            .contains("pending control response limit")
-    );
-}
-
-#[test]
-fn fake_omp_error_events_and_host_uri_denial_are_terminal() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    for (index, (prompt, status)) in [
-        ("__notice_error__", "failed"),
-        ("__retry_error__", "failed"),
-        ("__extension_error__", "failed"),
-        ("__host_uri__", "completed"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (turn_id, values) = bridge.start_turn(index as u64 + 3, &thread_id, prompt);
-        assert_eq!(
-            completed(&values).pointer("/params/turn/status"),
-            Some(&json!(status))
-        );
-        assert_eq!(
-            completed(&values).pointer("/params/turn/id"),
-            Some(&json!(turn_id))
-        );
+            bridge.send(json!({"type": "user", "text": "steering update", "client_user_message_id": "steer-item"}));
+        }
+        values.extend(bridge.finish());
+        if prompt == "__late_abort__" {
+            assert_eq!(status(&values), "interrupted");
+        } else {
+            assert_eq!(status(&values), "completed");
+            assert!(deltas(&values).starts_with("steered"));
+            assert!(
+                completed(&values)
+                    .pointer("/params/turn/items")
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item.get("clientId") == Some(&json!("steer-item")))
+            );
+        }
+        bridge.send(json!({"type": "user", "text": "after control", "provider": "anthropic", "model": "fake-model-2"}));
+        assert_eq!(identity(&bridge.finish()), initial);
     }
 }
 
 #[test]
-fn fake_omp_recovers_child_exit_between_turns() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, initial) = bridge.start_turn(3, &thread_id, "before crash");
-    let pid = identity(&initial).0;
-    assert!(
-        Command::new("kill")
-            .args(["-KILL", pid])
-            .status()
-            .unwrap()
-            .success()
-    );
+fn fake_omp_forced_abort_and_child_exit_resume_native_context() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.turn("__remember:SURVIVES");
+    let initial = identity(&bridge.turn("before abort"));
+    bridge.begin("__ignore_abort__");
+    bridge.send(json!({"type": "interrupt"}));
+    assert_eq!(status(&bridge.finish()), "interrupted");
+    assert_eq!(deltas(&bridge.turn("__recall__")), "SURVIVES");
+    let after = identity(&bridge.turn("after abort"));
+    assert_ne!(initial.0, after.0);
+    assert_eq!(initial.1, after.1);
+    let status = Command::new("kill")
+        .args(["-KILL", &after.0])
+        .status()
+        .unwrap();
+    assert!(status.success());
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        let state = Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &after.0])
             .output()
             .unwrap();
-        let state = String::from_utf8(state.stdout).unwrap();
+        let state = String::from_utf8(output.stdout).unwrap();
         if state.trim().is_empty() || state.trim().starts_with('Z') {
             break;
         }
         assert!(Instant::now() < deadline, "fake child did not exit");
         thread::sleep(Duration::from_millis(10));
     }
-    let (_, next) = bridge.start_turn(4, &thread_id, "after crash");
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_ne!(identity(&initial).0, identity(&next).0);
-    assert_eq!(identity(&initial).1, identity(&next).1);
+    assert_eq!(deltas(&bridge.turn("__recall__")), "SURVIVES");
 }
 
 #[test]
-fn fake_omp_recovers_existing_thread_resume_after_protocol_error() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, initial) = bridge.start_turn(3, &thread_id, "before malformed");
-    let (_, failed) = bridge.start_turn(4, &thread_id, "__malformed__");
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-    bridge.send(json!({
-        "id": 5, "method": "thread/resume",
-        "params": {"threadId": thread_id}
-    }));
-    let resumed = bridge.recv_until(|value| value.get("id") == Some(&json!(5)));
-    assert_eq!(
-        resumed.last().unwrap().pointer("/result/thread/id"),
-        Some(&json!(thread_id))
-    );
-    let (_, next) = bridge.start_turn(6, &thread_id, "after resume");
-    assert_eq!(identity(&initial).1, identity(&next).1);
-}
-
-#[test]
-fn fake_omp_preserves_early_events_reuses_session_and_handles_local_and_chunks() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-
-    let (turn_id, early) = bridge.start_turn(3, &thread_id, "__early__");
-    assert_eq!(
-        completed(&early)
-            .pointer("/params/turn/id")
-            .and_then(Value::as_str),
-        Some(turn_id.as_str())
-    );
-    assert_eq!(deltas(&early), vec!["early ", "event retained"]);
-
-    let (_, first) = bridge.start_turn(4, &thread_id, "normal one");
-    let first_pid = deltas(&first)
-        .into_iter()
-        .find(|delta| delta.starts_with("fake response pid="))
-        .unwrap()
-        .to_string();
-    let (_, second) = bridge.start_turn(5, &thread_id, "normal two");
-    assert!(deltas(&second).contains(&first_pid.as_str()));
-
-    let (_, local) = bridge.start_turn(6, &thread_id, "__local__");
-    assert!(deltas(&local).contains(&"local command completed"));
-    assert_eq!(
-        completed(&local)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-
-    let (_, chunked) = bridge.start_turn(7, &thread_id, "__chunk__");
-    assert!(deltas(&chunked).iter().any(|delta| delta.len() == 4096));
-    let (_, reasoning) = bridge.start_turn(8, &thread_id, "__reasoning__");
-    assert!(reasoning.iter().any(|value| {
-        value
-            .get("method")
-            .and_then(Value::as_str)
-            .is_some_and(|method| method.starts_with("item/reasoning/"))
-    }));
-
-    let (_, tool) = bridge.start_turn(9, &thread_id, "__tool__");
-    assert!(tool.iter().any(|value| {
-        value.get("method").and_then(Value::as_str) == Some("item/started")
-            && value.pointer("/params/item/tool").and_then(Value::as_str) == Some("read")
-    }));
-    assert!(tool.iter().any(|value| {
-        value.get("method").and_then(Value::as_str) == Some("item/completed")
-            && value.pointer("/params/item/tool").and_then(Value::as_str) == Some("read")
-    }));
-    bridge.send(json!({
-        "id": 10,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [
-                {"type": "text", "text": "__image__", "text_elements": []},
-                {"type": "image", "url": "data:image/png;base64,iVBORw0KGgo=", "detail": null}
-            ]
-        }
-    }));
-    bridge.recv_until(|value| value.get("id") == Some(&json!(10)));
-    let image = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert!(deltas(&image).contains(&"image count=1 mime=image/png"));
-}
-
-#[test]
-fn fake_omp_enforces_terminal_error_callback_and_abort_semantics() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-
-    let (_, nonterminal) = bridge.start_turn(3, &thread_id, "__nonterminal__");
-    assert!(deltas(&nonterminal).contains(&" continued"));
-    bridge.send(json!({
-        "id": 20,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": "__out_of_order__", "text_elements": []}]
-        }
-    }));
-    let turn_started = bridge.recv_until(|value| value.get("id") == Some(&json!(20)));
-    let active_turn_id = turn_started
-        .last()
-        .and_then(|value| value.pointer("/result/turn/id"))
-        .and_then(Value::as_str)
-        .unwrap()
-        .to_owned();
-    bridge.send(json!({
-        "id": 21,
-        "method": "turn/steer",
-        "params": {
-            "threadId": thread_id,
-            "expectedTurnId": active_turn_id,
-            "input": [{"type": "text", "text": "steer now", "text_elements": []}]
-        }
-    }));
-    let out_of_order = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
+fn fake_omp_bounds_unacknowledged_controls() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.begin("__silent_controls__");
+    for _ in 0..1025 {
+        bridge.send(json!({"type": "user", "text": "steer"}));
+    }
+    let failed = bridge.finish();
+    assert_eq!(status(&failed), "failed");
     assert!(
-        out_of_order
-            .iter()
-            .any(|value| value.get("id") == Some(&json!(21)))
+        completed(&failed)
+            .to_string()
+            .contains("pending control response limit")
     );
-    assert!(deltas(&out_of_order).contains(&"steered out of order"));
+}
 
-    let (_, late_error) = bridge.start_turn(4, &thread_id, "__late_error__");
-    assert_eq!(
-        completed(&late_error)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("failed")
-    );
-    assert!(
-        completed(&late_error)
+#[test]
+fn fake_omp_replays_captured_omp_18_3_turns() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let text = bridge.turn("__replay:text");
+    assert_eq!(status(&text), "completed");
+    assert_eq!(deltas(&text), "PONG-1");
+    let tool = bridge.turn("__replay:tool");
+    assert_eq!(status(&tool), "completed");
+    for event in ["item/started", "item/completed"] {
+        assert!(tool.iter().any(|value| method(value) == event
+            && value.pointer("/params/item/tool") == Some(&json!("bash"))));
+    }
+    assert_eq!(deltas(&tool), "PONG-2");
+    for (name, error) in [
+        ("provider_error", "Tracer non-retryable error"),
+        ("truncated_stream", "stream ended before message_stop"),
+    ] {
+        let values = bridge.turn(&format!("__replay:{name}"));
+        assert_eq!(status(&values), "failed");
+        let message = completed(&values)
             .pointer("/params/turn/error/message")
-            .and_then(Value::as_str)
             .unwrap()
-            .contains("scheduling failure")
-    );
-
-    let (_, ui) = bridge.start_turn(5, &thread_id, "__ui__");
-    assert_eq!(
-        completed(&ui)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-
-    let (_, host_tool) = bridge.start_turn(6, &thread_id, "__host_tool__");
-    assert_eq!(
-        completed(&host_tool)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-
-    bridge.send(json!({
-        "id": 7,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": "__hang__", "text_elements": []}]
-        }
-    }));
-    let response = bridge.recv_until(|value| value.get("id") == Some(&json!(7)));
-    let turn_id = response
-        .last()
-        .unwrap()
-        .pointer("/result/turn/id")
-        .and_then(Value::as_str)
-        .unwrap()
-        .to_string();
-    bridge.send(json!({
-        "id": 8,
-        "method": "turn/interrupt",
-        "params": {"threadId": thread_id, "turnId": turn_id}
-    }));
-    let interrupted = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert!(
-        interrupted
-            .iter()
-            .any(|value| value.get("id") == Some(&json!(8)))
-    );
-    assert_eq!(
-        completed(&interrupted)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("interrupted")
-    );
-
-    let (_, after_abort) = bridge.start_turn(9, &thread_id, "after abort");
-    assert_eq!(
-        completed(&after_abort)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
+            .as_str()
+            .unwrap();
+        assert!(message.contains(error), "{message}");
+        assert!(!message.contains("raw-http-request"), "{message}");
+    }
+    assert_eq!(deltas(&bridge.turn("__replay:text")), "PONG-1");
+    let retry = bridge.turn("__retried_provider_error__");
+    assert_eq!(status(&retry), "completed");
+    assert_eq!(deltas(&retry), "recovered after retry");
 }
 
 #[test]
-fn fake_omp_fails_closed_on_malformed_stdout_then_lazily_restarts_and_resumes() {
-    let root = temp_session_root();
-    let mut bridge = Bridge::spawn("jsonrpc", root.clone());
-    let thread_id = bridge.initialize_and_start();
-
-    let (_, initial) = bridge.start_turn(10, &thread_id, "before malformed");
-    let (_, malformed) = bridge.start_turn(3, &thread_id, "__malformed__");
-    assert_eq!(
-        completed(&malformed)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("failed")
-    );
-    let (_, restarted) = bridge.start_turn(4, &thread_id, "after malformed");
-    assert_eq!(
-        completed(&restarted)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-    assert_ne!(identity(&initial).0, identity(&restarted).0);
-    assert_eq!(identity(&initial).1, identity(&restarted).1);
-
-    let mut child = Bridge::spawn("jsonrpc", root.clone());
-    child.send(json!({"id": 1, "method": "initialize", "params": {}}));
-    child.recv_until(|value| value.get("id") == Some(&json!(1)));
-    child.send(json!({
-        "id": 2,
-        "method": "thread/resume",
-        "params": {
-            "threadId": thread_id,
-            "cwd": env!("CARGO_MANIFEST_DIR"),
-            "model": "fake-model",
-            "modelProvider": "anthropic"
-        }
-    }));
-    let resumed = child.recv_until(|value| value.get("id") == Some(&json!(2)));
-    assert_eq!(
-        resumed
-            .last()
-            .unwrap()
-            .pointer("/result/thread/id")
-            .and_then(Value::as_str),
-        Some(thread_id.as_str())
-    );
-    let (_, turn) = child.start_turn(3, &thread_id, "resumed");
-    assert_eq!(
-        completed(&turn)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-    assert_eq!(identity(&initial).1, identity(&turn).1);
+fn fake_omp_accepts_blocks_attachments() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    bridge.send(json!({"type": "user", "content": [{"type": "attachment", "name": "note.txt", "mimeType": "text/plain", "attachment_type": "document", "dataBase64": "aGVsbG8="}]}));
+    assert_eq!(deltas(&bridge.finish()), "document path accepted");
 }
 
 #[test]
-fn fake_omp_handles_new_ui_metadata_and_fails_on_persistence_loss() {
-    let mut bridge = Bridge::spawn("jsonrpc", temp_session_root());
-    let thread_id = bridge.initialize_and_start();
-    let (_, selected) = bridge.start_turn(3, &thread_id, "__ui_select__");
-    assert_eq!(
-        completed(&selected).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    let (_, failed) = bridge.start_turn(4, &thread_id, "__persistence_error__");
-    assert_eq!(
-        completed(&failed).pointer("/params/turn/status"),
-        Some(&json!("failed"))
-    );
-    let error = completed(&failed)
-        .pointer("/params/turn/error/message")
-        .and_then(Value::as_str)
-        .unwrap();
-    assert!(error.contains("session persistence failed"));
-    assert!(!error.contains("private-store-path"));
+fn stock_omp_image_count_uses_native_provider_limits() {
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let images: Vec<_> = (0..9)
+        .map(|_| json!({"type": "image", "url": "data:image/png;base64,aA=="}))
+        .collect();
+    let mut content = vec![json!({"type": "text", "text": "__image__", "text_elements": []})];
+    content.extend(images);
+    bridge.send(json!({"type": "user", "content": content}));
+    assert_eq!(deltas(&bridge.finish()), "image count=9");
 }
 
 #[test]
-fn fake_omp_blocks_mode_uses_same_stateful_runtime() {
-    let mut bridge = Bridge::spawn("blocks", temp_session_root());
-    bridge.send(json!({
-        "type": "user",
-        "text": "blocks turn",
-        "model": "fake-model",
-        "provider": "anthropic"
-    }));
-    let values = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&values)
-            .pointer("/params/turn/status")
-            .and_then(Value::as_str),
-        Some("completed")
-    );
-    bridge.send(json!({
-        "type": "user",
-        "content": [{
-            "type": "attachment",
-            "name": "__document__.txt",
-            "mimeType": "text/plain",
-            "attachment_type": "document",
-            "dataBase64": "aGVsbG8="
-        }],
-        "model": "fake-model",
-        "provider": "anthropic"
-    }));
-    let document = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert!(deltas(&document).contains(&"document path accepted"));
-}
-
-#[test]
-fn fake_omp_blocks_restart_preserves_session_identity() {
-    let root = temp_session_root();
-    let mut first = Bridge::spawn("blocks", root.clone());
-    first.send(json!({"type": "user", "text": "before restart"}));
-    let initial = first
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    first.child.kill().unwrap();
-    first.child.wait().unwrap();
-    let mut second = Bridge::spawn("blocks", root);
-    second.send(json!({"type": "user", "text": "after restart"}));
-    let resumed = second
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_ne!(identity(&initial).0, identity(&resumed).0);
-    assert_eq!(identity(&initial).1, identity(&resumed).1);
-    assert_eq!(
-        completed(&initial).pointer("/params/threadId"),
-        completed(&resumed).pointer("/params/threadId")
-    );
-}
-
-#[test]
-fn fake_omp_blocks_active_user_message_steers_current_turn() {
-    let mut bridge = Bridge::spawn("blocks", temp_session_root());
-    bridge.send(json!({"type": "user", "text": "__out_of_order__"}));
-    let started = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/started"));
-    bridge.send(json!({"type": "user", "text": "steer the active turn", "client_user_message_id": "steer-message"}));
-    let ended = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&ended).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    assert_eq!(deltas(&ended), ["steered out of order"]);
-    assert_eq!(
-        started.last().unwrap().pointer("/params/turn/id"),
-        completed(&ended).pointer("/params/turn/id")
-    );
-    bridge.send(json!({"type": "user", "text": "after steer"}));
-    let next = bridge
-        .recv_until(|value| value.get("method").and_then(Value::as_str) == Some("turn/completed"));
-    assert_eq!(
-        completed(&next).pointer("/params/turn/status"),
-        Some(&json!("completed"))
-    );
-    identity(&next);
+fn stock_omp_image_bytes_use_native_provider_limits() {
+    use base64::Engine;
+    let root = TestRoot::new();
+    let mut bridge = Bridge::spawn(&root, Some(KEY), &[]);
+    let data = base64::engine::general_purpose::STANDARD.encode(vec![0; 4 * 1024 * 1024 + 1]);
+    bridge.send(json!({"type": "user", "content": [
+        {"type": "text", "text": "__image__", "text_elements": []},
+        {"type": "image", "url": format!("data:image/png;base64,{data}")}
+    ]}));
+    assert_eq!(deltas(&bridge.finish()), "image count=1");
 }

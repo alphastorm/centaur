@@ -17,20 +17,20 @@ pub(crate) enum ProcessEvent {
     Eof,
 }
 
-/// A bounded, line-framed child process for stateful bidirectional harnesses.
+/// A bounded, line-framed OMP RPC process.
 ///
 /// The owner is the only writer. Stdout is read on a dedicated thread into a
 /// bounded channel, so a noisy child cannot allocate an unbounded event queue.
 /// Physical frame bounds are enforced while reading, before a complete line is
 /// allocated.
-pub(crate) struct StatefulProcess {
+pub(crate) struct OmpProcess {
     child: Child,
     stdin: ChildStdin,
     events: mpsc::Receiver<ProcessEvent>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
 }
 
-impl StatefulProcess {
+impl OmpProcess {
     pub(crate) fn spawn(mut command: Command, max_frame_bytes: usize) -> Result<Self> {
         command
             .stdin(Stdio::piped())
@@ -149,7 +149,7 @@ impl StatefulProcess {
     }
 }
 
-impl Drop for StatefulProcess {
+impl Drop for OmpProcess {
     fn drop(&mut self) {
         let _ = self.kill_and_wait();
     }
@@ -171,7 +171,7 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result
         if line.len().saturating_add(take) > max_bytes.saturating_add(1) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("stateful harness frame exceeds {max_bytes} bytes"),
+                format!("OMP frame exceeds {max_bytes} bytes"),
             ));
         }
         line.extend_from_slice(&available[..take]);

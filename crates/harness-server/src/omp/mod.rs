@@ -1,24 +1,17 @@
 mod normalize;
-mod persistence;
-mod profile;
+mod process;
 mod protocol;
 mod session;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-use codex_app_server_protocol::{
-    ApprovalsReviewer, AskForApproval, ClientResponse, InitializeResponse, JSONRPCError,
-    JSONRPCErrorError, JSONRPCMessage, JSONRPCRequest, JSONRPCResponse, RequestId, SandboxPolicy,
-    ServerNotification, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
-    ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
-    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
-};
-use serde_json::{Value, json};
+use codex_app_server_protocol::{ServerNotification, UserInput};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::otel::{TraceContext, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
@@ -26,433 +19,166 @@ use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
 };
-use crate::traits::{AppServerRuntime, HarnessKind, NormalizedEvent};
+use crate::traits::{HarnessKind, NormalizedEvent};
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
-use crate::util::{absolute_path, default_codex_home, write_value};
+use crate::util::write_value;
 use crate::wire::notification_to_wire_value;
 use crate::{HarnessServerError, Result};
 
-use self::persistence::SessionMapping;
-use self::profile::{OMP_VERSION, OmpProfile};
-use self::session::{OmpSession, TurnControl, TurnOutcome, load_resume_mapping};
+use self::session::{OmpSession, TurnControl};
 
-#[derive(Debug, Default)]
-pub struct OmpRuntime;
-
-impl AppServerRuntime for OmpRuntime {
-    fn run_stdio(&self) -> Result<()> {
-        run_app_server()
-    }
-}
-
-struct OmpThreadState {
+struct OmpThread {
     id: String,
     cwd: PathBuf,
-    model: String,
-    model_provider: String,
-    service_tier: Option<String>,
-    completed_turns: Vec<codex_app_server_protocol::Turn>,
+    session_dir: PathBuf,
     session: Option<OmpSession>,
-    resume: Option<SessionMapping>,
-    thread_started_sent: bool,
+    started: bool,
 }
 
-enum RuntimeInput {
-    JsonRpc(JSONRPCRequest),
-    Blocks(BlocksCommand),
-    BlocksError(String),
-}
-
-pub(crate) fn run_blocks_server() -> Result<()> {
-    let profile = OmpProfile::load()?;
-    let cwd = env::current_dir()?;
+/// One blocks stream owns one OMP process and native session directory.
+pub fn run_omp_blocks_server() -> Result<()> {
     let id = env::var("CENTAUR_THREAD_KEY")
         .ok()
         .filter(|id| !id.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let resume = persistence::load(&profile, &id)?;
-    let mut state = OmpThreadState {
+    let root = env::var_os("CENTAUR_OMP_SESSION_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env::var_os("HOME").unwrap_or_else(|| ".".into()))
+                .join(".omp/centaur-sessions")
+        });
+    let session_dir = root.join(format!("{:x}", Sha256::digest(id.as_bytes())));
+    fs::create_dir_all(&session_dir)?;
+    let mut state = OmpThread {
         id,
-        cwd,
-        model: String::new(),
-        model_provider: String::new(),
-        service_tier: None,
-        completed_turns: Vec::new(),
+        cwd: env::current_dir()?,
+        session_dir,
         session: None,
-        resume,
-        thread_started_sent: false,
+        started: false,
     };
-    let mut stdout = io::stdout().lock();
     let (command_tx, command_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let stdin = io::stdin();
         let mut blocks_state = BlocksState::default();
         for raw in stdin.lock().lines() {
-            let Ok(line) = raw else {
-                break;
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+            let Ok(line) = raw else { break };
+            if line.trim().is_empty() {
                 continue;
             }
-            let input = match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
-                Ok(command) => RuntimeInput::Blocks(command),
-                Err(error) => RuntimeInput::BlocksError(error.to_string()),
-            };
-            if command_tx.send(input).is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Ok(input) = command_rx.recv() {
-        match input {
-            RuntimeInput::Blocks(BlocksCommand::User {
-                input,
-                client_user_message_id,
-                model,
-                provider,
-                reasoning: _,
-                trace_context,
-            }) => {
-                if let Some(model) = model {
-                    state.model = model;
-                }
-                if let Some(provider) = provider {
-                    state.model_provider = provider;
-                }
-                let result = run_normalized_turn(
-                    &profile,
-                    &mut state,
-                    &input,
-                    OmpTurnRequest {
-                        client_user_message_id,
-                        trace_context: Some(&trace_context),
-                        turn_id: None,
-                    },
-                    &command_rx,
-                    &mut stdout,
-                );
-                if let Err(error) = result {
-                    write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
-                }
-            }
-            RuntimeInput::Blocks(BlocksCommand::Interrupt | BlocksCommand::AttachmentChunk) => {}
-            RuntimeInput::BlocksError(error) => {
-                write_blocks_error(&mut stdout, &state.id, "input", error)?;
-            }
-            RuntimeInput::JsonRpc(_) => {}
-        }
-    }
-    Ok(())
-}
-
-fn run_app_server() -> Result<()> {
-    let profile = OmpProfile::load()?;
-    let (request_tx, request_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        for raw in stdin.lock().lines() {
-            let Ok(line) = raw else {
-                break;
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let message = match serde_json::from_str::<JSONRPCMessage>(trimmed) {
-                Ok(message) => message,
-                Err(error) => {
-                    eprintln!("invalid JSON-RPC message: {error}");
-                    continue;
-                }
-            };
-            let JSONRPCMessage::Request(request) = message else {
-                continue;
-            };
-            if request_tx.send(RuntimeInput::JsonRpc(request)).is_err() {
+            let command = parse_blocks_line_with_state(line.trim(), &mut blocks_state)
+                .map_err(|error| error.to_string());
+            if command_tx.send(command).is_err() {
                 break;
             }
         }
     });
 
     let mut stdout = io::stdout().lock();
-    let mut threads = HashMap::new();
-    while let Ok(input) = request_rx.recv() {
-        let RuntimeInput::JsonRpc(request) = input else {
-            continue;
-        };
-        let request_id = request.id.clone();
-        if handle_request(&profile, request, &request_rx, &mut threads, &mut stdout).is_err() {
-            eprintln!("OMP request failed");
-            write_error(
-                &mut stdout,
-                request_id,
-                -32000,
-                "OMP request failed".to_owned(),
-            )?;
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            Ok(BlocksCommand::User {
+                input,
+                client_user_message_id,
+                model,
+                provider,
+                trace_context,
+                ..
+            }) => {
+                if let Err(error) = run_turn(
+                    &mut state,
+                    &input,
+                    client_user_message_id,
+                    provider.as_deref().unwrap_or_default(),
+                    model.as_deref().unwrap_or_default(),
+                    &trace_context,
+                    &command_rx,
+                    &mut stdout,
+                ) {
+                    write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
+                }
+            }
+            Ok(BlocksCommand::Interrupt | BlocksCommand::AttachmentChunk) => {}
+            Err(error) => write_blocks_error(&mut stdout, &state.id, "input", error)?,
         }
     }
     Ok(())
 }
 
-fn handle_request<W: Write>(
-    profile: &OmpProfile,
-    request: JSONRPCRequest,
-    request_rx: &Receiver<RuntimeInput>,
-    threads: &mut HashMap<String, OmpThreadState>,
-    stdout: &mut W,
-) -> Result<()> {
-    match request.method.as_str() {
-        "initialize" => write_client_response(
-            stdout,
-            ClientResponse::Initialize {
-                request_id: request.id,
-                response: InitializeResponse {
-                    user_agent: format!("harness-server omp/{OMP_VERSION}"),
-                    codex_home: absolute_path(
-                        env::var_os("CODEX_HOME")
-                            .map(PathBuf::from)
-                            .unwrap_or_else(default_codex_home),
-                    )?,
-                    platform_family: env::consts::FAMILY.to_string(),
-                    platform_os: env::consts::OS.to_string(),
-                },
-            },
-        ),
-        "thread/start" => {
-            let params: ThreadStartParams = request_params(request.params)?;
-            let cwd = request_cwd(params.cwd.as_deref())?;
-            let mut state = OmpThreadState {
-                id: Uuid::new_v4().to_string(),
-                cwd,
-                model: params.model.clone().unwrap_or_default(),
-                model_provider: params.model_provider.clone().unwrap_or_default(),
-                service_tier: params.service_tier.clone().flatten(),
-                completed_turns: Vec::new(),
-                session: None,
-                resume: None,
-                thread_started_sent: false,
-            };
-            ensure_session(profile, &mut state)?;
-            sync_model_from_session(&mut state);
-            let thread_id = state.id.clone();
-            let normalizer = normalizer_for(&state, "turn-placeholder");
-            let response = ThreadStartResponse {
-                thread: normalizer.thread_snapshot()?,
-                model: state.model.clone(),
-                model_provider: state.model_provider.clone(),
-                service_tier: state.service_tier.clone(),
-                cwd: absolute_path(state.cwd.clone())?,
-                runtime_workspace_roots: Vec::new(),
-                instruction_sources: Vec::new(),
-                approval_policy: AskForApproval::Never,
-                approvals_reviewer: ApprovalsReviewer::User,
-                sandbox: SandboxPolicy::DangerFullAccess,
-                active_permission_profile: None,
-                reasoning_effort: None,
-            };
-            threads.insert(thread_id, state);
-            write_client_response(
-                stdout,
-                ClientResponse::ThreadStart {
-                    request_id: request.id,
-                    response,
-                },
-            )
-        }
-        "thread/resume" => {
-            let params: ThreadResumeParams = request_params(request.params)?;
-            let thread_id = params.thread_id.clone();
-            if !threads.contains_key(&thread_id) {
-                let resume = load_resume_mapping(profile, &thread_id)?;
-                let mut state = OmpThreadState {
-                    id: thread_id.clone(),
-                    cwd: request_cwd(params.cwd.as_deref())?,
-                    model: params.model.clone().unwrap_or_default(),
-                    model_provider: params.model_provider.clone().unwrap_or_default(),
-                    service_tier: params.service_tier.clone().flatten(),
-                    completed_turns: Vec::new(),
-                    session: None,
-                    resume: Some(resume),
-                    thread_started_sent: false,
-                };
-                ensure_session(profile, &mut state)?;
-                sync_model_from_session(&mut state);
-                threads.insert(thread_id.clone(), state);
-            }
-            let state = threads
-                .get_mut(&thread_id)
-                .expect("OMP resume state inserted or existed");
-            if let Some(model) = params.model.filter(|model| !model.is_empty()) {
-                state.model = model;
-            }
-            if let Some(provider) = params
-                .model_provider
-                .filter(|provider| !provider.is_empty())
-            {
-                state.model_provider = provider;
-            }
-            let requested_provider = state.model_provider.clone();
-            let requested_model = state.model.clone();
-            ensure_session(profile, state)?;
-            state
-                .session
-                .as_mut()
-                .expect("OMP resume session initialized")
-                .ensure_model(&requested_provider, &requested_model)?;
-            sync_model_from_session(state);
-            let normalizer = normalizer_for(state, "turn-placeholder");
-            let mut thread = normalizer.thread_snapshot()?;
-            if !params.exclude_turns {
-                thread.turns = state.completed_turns.clone();
-            }
-            write_client_response(
-                stdout,
-                ClientResponse::ThreadResume {
-                    request_id: request.id,
-                    response: ThreadResumeResponse {
-                        thread,
-                        model: state.model.clone(),
-                        model_provider: state.model_provider.clone(),
-                        service_tier: state.service_tier.clone(),
-                        cwd: absolute_path(state.cwd.clone())?,
-                        runtime_workspace_roots: Vec::new(),
-                        instruction_sources: Vec::new(),
-                        approval_policy: AskForApproval::Never,
-                        approvals_reviewer: ApprovalsReviewer::User,
-                        sandbox: SandboxPolicy::DangerFullAccess,
-                        active_permission_profile: None,
-                        reasoning_effort: None,
-                        initial_turns_page: None,
-                    },
-                },
-            )
-        }
-        "turn/start" => {
-            let params: TurnStartParams = request_params(request.params)?;
-            let state = threads.get_mut(&params.thread_id).ok_or_else(|| {
-                HarnessServerError::UnknownThread {
-                    thread_id: params.thread_id.clone(),
-                }
-            })?;
-            let turn_id = format!("turn-{}", Uuid::new_v4().simple());
-            let normalizer = normalizer_for(state, &turn_id);
-            write_client_response(
-                stdout,
-                ClientResponse::TurnStart {
-                    request_id: request.id,
-                    response: TurnStartResponse {
-                        turn: normalizer.turn_snapshot(TurnStatus::InProgress),
-                    },
-                },
-            )?;
-            run_normalized_turn(
-                profile,
-                state,
-                &params.input,
-                OmpTurnRequest {
-                    client_user_message_id: params.client_user_message_id,
-                    trace_context: None,
-                    turn_id: Some(turn_id),
-                },
-                request_rx,
-                stdout,
-            )
-        }
-        "turn/interrupt" => {
-            let _params: TurnInterruptParams = request_params(request.params)?;
-            write_client_response(
-                stdout,
-                ClientResponse::TurnInterrupt {
-                    request_id: request.id,
-                    response: TurnInterruptResponse {},
-                },
-            )
-        }
-        "turn/steer" => write_error(
-            stdout,
-            request.id,
-            -32600,
-            "no active OMP turn to steer".to_string(),
-        ),
-        _ => write_error(
-            stdout,
-            request.id,
-            -32601,
-            format!("method not found: {}", request.method),
-        ),
-    }
-}
-
-struct OmpTurnRequest<'a> {
-    client_user_message_id: Option<String>,
-    trace_context: Option<&'a TraceContext>,
-    turn_id: Option<String>,
-}
-
-fn run_normalized_turn<W: Write>(
-    profile: &OmpProfile,
-    state: &mut OmpThreadState,
+#[allow(clippy::too_many_arguments)]
+fn run_turn<W: Write>(
+    state: &mut OmpThread,
     input: &[UserInput],
-    request: OmpTurnRequest<'_>,
-    request_rx: &Receiver<RuntimeInput>,
+    client_user_message_id: Option<String>,
+    requested_provider: &str,
+    requested_model: &str,
+    trace_context: &TraceContext,
+    commands: &Receiver<std::result::Result<BlocksCommand, String>>,
     stdout: &mut W,
 ) -> Result<()> {
-    let setup = ensure_session(profile, state);
-    let requested_provider = state.model_provider.clone();
-    let requested_model = state.model.clone();
-    let setup = setup.and_then(|()| {
-        state
-            .session
-            .as_mut()
-            .expect("OMP session ensured")
-            .ensure_model(&requested_provider, &requested_model)
-    });
-    sync_model_from_session(state);
-    let turn_id = request
-        .turn_id
-        .unwrap_or_else(|| format!("turn-{}", Uuid::new_v4().simple()));
-    let normalizer = RefCell::new(normalizer_for(state, &turn_id));
+    let setup = (|| {
+        if let Some(session) = state.session.as_mut()
+            && session.has_exited()?
+        {
+            state.session = None;
+        }
+        if let Some(session) = state.session.as_mut() {
+            session.ensure_model(requested_provider, requested_model)?;
+        } else {
+            state.session = Some(OmpSession::start(
+                &state.session_dir,
+                &state.cwd,
+                requested_provider,
+                requested_model,
+            )?);
+        }
+        Ok(())
+    })();
+    let turn_id = format!("turn-{}", Uuid::new_v4().simple());
+    let model = state.session.as_ref().and_then(OmpSession::model);
+    let mut config = BridgeConfig::new(state.id.clone(), turn_id.clone());
+    config.cwd = state.cwd.clone();
+    config.cli_version = "omp".to_string();
+    config.model_provider = model
+        .map(|model| model.provider.clone())
+        .unwrap_or_default();
     let mut telemetry = TurnTelemetry::new(
-        request.trace_context,
+        Some(trace_context),
         HarnessKind::Omp,
-        state.model.clone(),
-        state.model_provider.clone(),
+        model.map(|model| model.id.clone()).unwrap_or_default(),
+        config.model_provider.clone(),
         &turn_id,
         usage_span_input_value(input),
     );
+    let normalizer = RefCell::new(CodexTurnNormalizer::new(config));
     let output = RefCell::new(stdout);
-
     for notification in normalizer
         .borrow_mut()
-        .start_notifications(!state.thread_started_sent)?
+        .start_notifications(!state.started)?
     {
         if matches!(notification, ServerNotification::ThreadStarted(_)) {
-            state.thread_started_sent = true;
+            state.started = true;
         }
         write_notification(&mut **output.borrow_mut(), &notification)?;
     }
     for notification in normalizer
         .borrow_mut()
-        .emit_user_message(request.client_user_message_id, input.to_vec())?
+        .emit_user_message(client_user_message_id, input.to_vec())?
     {
         write_notification(&mut **output.borrow_mut(), &notification)?;
     }
-
-    let thread_id = state.id.clone();
-    let active_turn_id = turn_id.clone();
     let result = setup.and_then(|()| {
-        let session = state.session.as_mut().expect("OMP session ensured");
-        session.run_turn(
-            input,
-            || {
-                loop {
-                    match request_rx.try_recv() {
-                        Ok(RuntimeInput::Blocks(BlocksCommand::Interrupt)) => {
+        state
+            .session
+            .as_mut()
+            .expect("OMP session started")
+            .run_turn(
+                input,
+                || loop {
+                    match commands.try_recv() {
+                        Ok(Ok(BlocksCommand::Interrupt)) => {
                             return Ok(Some(TurnControl::Interrupt));
                         }
-                        Ok(RuntimeInput::Blocks(BlocksCommand::User {
+                        Ok(Ok(BlocksCommand::User {
                             input,
                             client_user_message_id,
                             ..
@@ -465,97 +191,34 @@ fn run_normalized_turn<W: Write>(
                             }
                             return Ok(Some(TurnControl::Steer(input)));
                         }
-                        Ok(RuntimeInput::Blocks(BlocksCommand::AttachmentChunk)) => continue,
-                        Ok(RuntimeInput::BlocksError(error)) => {
-                            return Err(HarnessServerError::Protocol(error));
-                        }
-                        Ok(RuntimeInput::JsonRpc(request)) => match request.method.as_str() {
-                            "turn/steer" => {
-                                let params: TurnSteerParams = request_params(request.params)?;
-                                if params.thread_id != thread_id
-                                    || params.expected_turn_id != active_turn_id
-                                {
-                                    write_error(
-                                        &mut **output.borrow_mut(),
-                                        request.id,
-                                        -32600,
-                                        "OMP steer does not match the active thread/turn"
-                                            .to_string(),
-                                    )?;
-                                    continue;
-                                }
-                                for notification in normalizer.borrow_mut().emit_user_message(
-                                    params.client_user_message_id,
-                                    params.input.clone(),
-                                )? {
-                                    write_notification(&mut **output.borrow_mut(), &notification)?;
-                                }
-                                write_client_response(
-                                    &mut **output.borrow_mut(),
-                                    ClientResponse::TurnSteer {
-                                        request_id: request.id,
-                                        response: TurnSteerResponse {
-                                            turn_id: active_turn_id.clone(),
-                                        },
-                                    },
-                                )?;
-                                return Ok(Some(TurnControl::Steer(params.input)));
-                            }
-                            "turn/interrupt" => {
-                                let params: TurnInterruptParams = request_params(request.params)?;
-                                if params.thread_id != thread_id || params.turn_id != active_turn_id
-                                {
-                                    write_error(
-                                        &mut **output.borrow_mut(),
-                                        request.id,
-                                        -32600,
-                                        "OMP interrupt does not match the active thread/turn"
-                                            .to_string(),
-                                    )?;
-                                    continue;
-                                }
-                                write_client_response(
-                                    &mut **output.borrow_mut(),
-                                    ClientResponse::TurnInterrupt {
-                                        request_id: request.id,
-                                        response: TurnInterruptResponse {},
-                                    },
-                                )?;
-                                return Ok(Some(TurnControl::Interrupt));
-                            }
-                            _ => {
-                                write_error(
-                                    &mut **output.borrow_mut(),
-                                    request.id,
-                                    -32600,
-                                    format!(
-                                        "cannot handle {} while an OMP turn is active",
-                                        request.method
-                                    ),
-                                )?;
-                            }
-                        },
-                        Err(TryRecvError::Empty) => return Ok(None),
-                        Err(TryRecvError::Disconnected) => return Ok(None),
+                        Ok(Ok(BlocksCommand::AttachmentChunk)) => continue,
+                        Ok(Err(error)) => return Err(HarnessServerError::Protocol(error)),
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => return Ok(None),
                     }
-                }
-            },
-            |event| {
-                telemetry.observe_normalized(&event);
-                for notification in normalizer.borrow_mut().process_event(&event)? {
-                    let value = notification_to_wire_value(&notification)?;
-                    telemetry.observe_tool_notification(&value);
-                    write_value(&mut **output.borrow_mut(), &value)?;
-                }
-                Ok(())
-            },
-        )
+                },
+                |event| {
+                    telemetry.observe_normalized(&event);
+                    for notification in normalizer.borrow_mut().process_event(&event)? {
+                        let value = notification_to_wire_value(&notification)?;
+                        telemetry.observe_tool_notification(&value);
+                        write_value(&mut **output.borrow_mut(), &value)?;
+                    }
+                    Ok(())
+                },
+            )
     });
-
-    let outcome = match result {
-        Ok(outcome) => outcome,
+    let terminal = match result {
+        Ok(outcome) if outcome.interrupted => {
+            telemetry.finish(TelemetryTurnStatus::Cancelled);
+            normalizer.borrow_mut().finish_turn_interrupted()?
+        }
+        Ok(_) => {
+            telemetry.finish(TelemetryTurnStatus::Completed);
+            normalizer.borrow_mut().finish_turn(None)?
+        }
         Err(error) => {
             telemetry.finish(TelemetryTurnStatus::Failed);
+            // Drop waits for the child before publishing a non-retry failure.
             state.session = None;
             let message = error.to_string();
             for notification in normalizer
@@ -566,144 +229,15 @@ fn run_normalized_turn<W: Write>(
             {
                 write_notification(&mut **output.borrow_mut(), &notification)?;
             }
-            finish_turn(
-                state,
-                &mut normalizer.borrow_mut(),
-                &mut **output.borrow_mut(),
-                Some(message),
-                false,
-            )?;
-            return Ok(());
+            normalizer.borrow_mut().finish_turn(Some(message))?
         }
     };
-    telemetry.finish(if outcome.interrupted {
-        TelemetryTurnStatus::Cancelled
-    } else {
-        TelemetryTurnStatus::Completed
-    });
-    finish_outcome(
-        state,
-        &mut normalizer.borrow_mut(),
-        &mut **output.borrow_mut(),
-        outcome,
-    )
-}
-
-fn finish_outcome<W: Write>(
-    state: &mut OmpThreadState,
-    normalizer: &mut CodexTurnNormalizer,
-    stdout: &mut W,
-    outcome: TurnOutcome,
-) -> Result<()> {
-    let _usage = outcome.usage;
-    if let Some(session) = state.session.as_mut()
-        && session.has_exited()?
-    {
-        state.session = None;
-    }
-    finish_turn(state, normalizer, stdout, None, outcome.interrupted)
-}
-
-fn finish_turn<W: Write>(
-    state: &mut OmpThreadState,
-    normalizer: &mut CodexTurnNormalizer,
-    stdout: &mut W,
-    error: Option<String>,
-    interrupted: bool,
-) -> Result<()> {
-    let notification = if interrupted {
-        normalizer.finish_turn_interrupted()?
-    } else {
-        normalizer.finish_turn(error)?
-    };
-    if let Some(notification) = notification {
-        if let ServerNotification::TurnCompleted(completed) = &notification {
-            state.completed_turns.push(completed.turn.clone());
-        }
-        write_notification(stdout, &notification)?;
+    if let Some(notification) = terminal {
+        write_notification(&mut **output.borrow_mut(), &notification)?;
     }
     Ok(())
-}
-
-fn ensure_session(profile: &OmpProfile, state: &mut OmpThreadState) -> Result<()> {
-    if let Some(session) = state.session.as_mut()
-        && session.has_exited()?
-    {
-        state.session = None;
-    }
-    if state.session.is_none() {
-        let session = OmpSession::start(
-            profile.clone(),
-            &state.id,
-            &state.cwd,
-            &state.model_provider,
-            &state.model,
-            state.resume.as_ref(),
-        )?;
-        state.resume = Some(load_resume_mapping(profile, &state.id)?);
-        state.session = Some(session);
-    }
-    Ok(())
-}
-
-fn sync_model_from_session(state: &mut OmpThreadState) {
-    let Some(session) = &state.session else {
-        return;
-    };
-    if let Some(model) = session.state().get("model") {
-        if let Some(provider) = model.get("provider").and_then(Value::as_str) {
-            state.model_provider = provider.to_string();
-        }
-        if let Some(id) = model.get("id").and_then(Value::as_str) {
-            state.model = id.to_string();
-        }
-    }
-}
-
-fn normalizer_for(state: &OmpThreadState, turn_id: &str) -> CodexTurnNormalizer {
-    let mut config = BridgeConfig::new(state.id.clone(), turn_id.to_string());
-    config.cwd = state.cwd.clone();
-    config.cli_version = format!("omp-{OMP_VERSION}");
-    config.model_provider = state.model_provider.clone();
-    CodexTurnNormalizer::new(config)
-}
-
-fn request_cwd(cwd: Option<&str>) -> Result<PathBuf> {
-    let cwd = cwd.map(PathBuf::from).unwrap_or(env::current_dir()?);
-    if cwd.is_absolute() {
-        Ok(cwd)
-    } else {
-        Ok(env::current_dir()?.join(cwd))
-    }
-}
-
-fn request_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result<T> {
-    serde_json::from_value(params.unwrap_or_else(|| json!({})))
-        .map_err(|source| HarnessServerError::InvalidParams { source })
 }
 
 fn write_notification<W: Write>(stdout: &mut W, notification: &ServerNotification) -> Result<()> {
     write_value(stdout, &notification_to_wire_value(notification)?)
-}
-
-fn write_client_response<W: Write>(stdout: &mut W, response: ClientResponse) -> Result<()> {
-    let (id, result) = response.into_jsonrpc_parts()?;
-    write_value(
-        stdout,
-        &serde_json::to_value(JSONRPCMessage::Response(JSONRPCResponse { id, result }))?,
-    )
-}
-
-fn write_error<W: Write>(stdout: &mut W, id: RequestId, code: i64, message: String) -> Result<()> {
-    write_value(
-        stdout,
-        &serde_json::to_value(JSONRPCMessage::Error(JSONRPCError {
-            id,
-            error: JSONRPCErrorError {
-                code,
-                message,
-                data: None,
-            },
-        }))?,
-    )
 }

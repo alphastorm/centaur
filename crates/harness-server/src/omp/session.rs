@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -10,14 +12,12 @@ use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
 use crate::omp::normalize::{MAX_RENDERED_TEXT_BYTES, OmpEventNormalizer};
-use crate::omp::persistence::{self, SessionMapping};
-use crate::omp::profile::{OmpProfile, validate_contained_session_path};
+use crate::omp::process::{OmpProcess, ProcessEvent};
 use crate::omp::protocol::{
-    Decoder, MAX_PHYSICAL_FRAME_BYTES, frame_type, is_state_notification, parse_ready,
+    MAX_FRAME_BYTES, Model, Response, State, frame_type, is_state_notification, parse_ready,
     protocol_error,
 };
-use crate::stateful::{ProcessEvent, StatefulProcess};
-use crate::traits::{HarnessKind, NormalizedEvent, NormalizedTokenUsage};
+use crate::traits::{HarnessKind, NormalizedEvent};
 use crate::{HarnessServerError, Result};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -25,8 +25,6 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const ABORT_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_IMAGES: usize = 8;
-const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PENDING_CONTROLS: usize = 1024;
 
 #[derive(Debug)]
@@ -38,47 +36,54 @@ pub(crate) enum TurnControl {
 #[derive(Debug, Clone)]
 pub(crate) struct TurnOutcome {
     pub(crate) interrupted: bool,
-    pub(crate) usage: Option<NormalizedTokenUsage>,
 }
 
 pub(crate) struct OmpSession {
-    profile: OmpProfile,
-    process: StatefulProcess,
-    decoder: Decoder,
+    process: OmpProcess,
     next_id: u64,
     pending_controls: HashMap<String, (&'static str, u64)>,
-    thread_id: String,
-    state: Value,
+    model: Option<Model>,
     normalizer: OmpEventNormalizer,
 }
 
 impl OmpSession {
     pub(crate) fn start(
-        profile: OmpProfile,
-        thread_id: &str,
+        session_dir: &Path,
         cwd: &Path,
-        requested_provider: &str,
-        requested_model: &str,
-        resume: Option<&SessionMapping>,
+        provider: &str,
+        model: &str,
     ) -> Result<Self> {
-        let command = profile.command(cwd);
-        let process = StatefulProcess::spawn(command, MAX_PHYSICAL_FRAME_BYTES)?;
+        let binary = env::var_os("CENTAUR_OMP_BIN").unwrap_or_else(|| "omp".into());
+        let mut command = Command::new(binary);
+        // RPC mode is the headless NDJSON interface; all native tools and settings remain enabled.
+        command
+            .current_dir(cwd)
+            .args(["--mode", "rpc", "--session-dir"])
+            .arg(session_dir)
+            .arg("--continue");
+        if !model.is_empty() {
+            command.arg("--model");
+            if provider.is_empty() || model.contains('/') {
+                command.arg(model);
+            } else {
+                command.arg(format!("{provider}/{model}"));
+            }
+        }
         let mut session = Self {
-            profile,
-            process,
-            decoder: Decoder::default(),
+            process: OmpProcess::spawn(command, MAX_FRAME_BYTES)?,
             next_id: 1,
             pending_controls: HashMap::new(),
-            thread_id: thread_id.to_string(),
-            state: Value::Null,
+            model: None,
             normalizer: OmpEventNormalizer::default(),
         };
-        session.initialize(requested_provider, requested_model, resume)?;
+        parse_ready(session.recv_required_frame(Instant::now() + STARTUP_TIMEOUT)?)?;
+        let response = session.send_command_wait("get_state", json!({}), COMMAND_TIMEOUT)?;
+        session.model = serde_json::from_value::<State>(response.data)?.model;
         Ok(session)
     }
 
-    pub(crate) fn state(&self) -> &Value {
-        &self.state
+    pub(crate) fn model(&self) -> Option<&Model> {
+        self.model.as_ref()
     }
 
     pub(crate) fn has_exited(&mut self) -> Result<bool> {
@@ -119,7 +124,6 @@ impl OmpSession {
         let mut abort_deadline = None;
         let mut turn_error = None;
         let mut pending_command_output = String::new();
-        let mut usage = None;
 
         loop {
             while let Some(control) = poll_control()? {
@@ -160,17 +164,14 @@ impl OmpSession {
                     .take_assistant_error()
                     .filter(|_| !interrupted);
                 emit(NormalizedEvent::Result { error })?;
-                return Ok(TurnOutcome { interrupted, usage });
+                return Ok(TurnOutcome { interrupted });
             }
             if interrupted && abort_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 let _ = self.process.kill_and_wait();
                 if let Some(error) = turn_error {
                     return Err(protocol_error(error));
                 }
-                return Ok(TurnOutcome {
-                    interrupted: true,
-                    usage,
-                });
+                return Ok(TurnOutcome { interrupted: true });
             }
             if !prompt_acknowledged && started.elapsed() >= COMMAND_TIMEOUT {
                 return Err(protocol_error("OMP prompt acknowledgement timed out"));
@@ -188,8 +189,7 @@ impl OmpSession {
             }
 
             let frame = match self.recv_frame(POLL_INTERVAL) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => continue,
+                Ok(frame) => frame,
                 Err(HarnessServerError::Protocol(message)) if message.contains("timed out") => {
                     continue;
                 }
@@ -198,18 +198,10 @@ impl OmpSession {
             let kind = frame_type(&frame)?;
 
             if kind == "response" {
-                let id = frame
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| protocol_error("OMP response omitted string id"))?;
-                let command = frame
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| protocol_error("OMP response omitted command"))?;
-                let success = frame
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(|| protocol_error("OMP response omitted success"))?;
+                let response: Response = serde_json::from_value(frame)?;
+                let id = response.id.as_str();
+                let command = response.command.as_str();
+                let success = response.success;
                 if id == prompt_id {
                     if command != "prompt" {
                         return Err(protocol_error("OMP prompt response command mismatch"));
@@ -217,16 +209,11 @@ impl OmpSession {
                     if !success {
                         return Err(protocol_error(format!(
                             "OMP prompt failed: {}",
-                            bounded_error(frame.get("error").and_then(Value::as_str))
+                            bounded_error(response.error.as_deref())
                         )));
                     }
                     prompt_acknowledged = true;
-                    if frame
-                        .get("data")
-                        .and_then(|data| data.get("agentInvoked"))
-                        .and_then(Value::as_bool)
-                        == Some(false)
-                    {
+                    if response.data.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
                         for event in self
                             .normalizer
                             .command_output(&pending_command_output, true)
@@ -248,10 +235,7 @@ impl OmpSession {
                             "OMP terminal state check failed or mismatched",
                         ));
                     }
-                    let streaming = frame
-                        .pointer("/data/isStreaming")
-                        .and_then(Value::as_bool)
-                        .ok_or_else(|| protocol_error("OMP terminal state omitted isStreaming"))?;
+                    let streaming = serde_json::from_value::<State>(response.data)?.is_streaming;
                     terminal_check = None;
                     // OMP 18.3 terminals carry no prompt ID. A response issued
                     // for this prompt confirms quiescence; a stale terminal
@@ -351,9 +335,6 @@ impl OmpSession {
             }
 
             for event in self.normalizer.normalize(&frame)? {
-                if let NormalizedEvent::TokenUsage { usage: event_usage } = &event {
-                    usage = Some(event_usage.clone());
-                }
                 if let NormalizedEvent::Error { message } = event {
                     turn_error.get_or_insert(message);
                     if !interrupted {
@@ -372,193 +353,32 @@ impl OmpSession {
         }
     }
 
-    pub(crate) fn ensure_model(
-        &mut self,
-        requested_provider: &str,
-        requested_model: &str,
-    ) -> Result<()> {
-        let requested_pair = match (requested_provider, requested_model) {
-            ("", "") => None,
-            ("", combined) => {
-                let (provider, model) = combined.split_once('/').ok_or_else(|| {
-                    protocol_error("OMP model overrides without a provider must use provider/model")
-                })?;
-                if provider.is_empty() || model.is_empty() {
-                    return Err(protocol_error(
-                        "OMP model overrides without a provider must use provider/model",
-                    ));
-                }
-                Some((provider.to_owned(), model.to_owned()))
-            }
-            (provider, model) if !provider.is_empty() && !model.is_empty() => {
-                Some((provider.to_owned(), model.to_owned()))
-            }
-            _ => {
-                return Err(protocol_error(
-                    "OMP provider and model must be selected together",
-                ));
-            }
-        };
-        let (observed_provider, observed_model) = state_model(&self.state)?;
-        let (desired_provider, desired_model) =
-            requested_pair.unwrap_or_else(|| (observed_provider.clone(), observed_model.clone()));
-        self.profile
-            .verify_allowed_model(&desired_provider, &desired_model)?;
-
-        if desired_provider != observed_provider || desired_model != observed_model {
-            let available =
-                self.send_command_wait("get_available_models", json!({}), COMMAND_TIMEOUT)?;
-            let available_from_runtime = available
-                .get("data")
-                .and_then(|data| data.get("models"))
-                .and_then(Value::as_array)
-                .is_some_and(|models| {
-                    models.iter().any(|model| {
-                        model.get("provider").and_then(Value::as_str)
-                            == Some(desired_provider.as_str())
-                            && model.get("id").and_then(Value::as_str)
-                                == Some(desired_model.as_str())
-                    })
-                });
-            if !available_from_runtime {
-                return Err(protocol_error(
-                    "requested OMP provider/model is unavailable in the pinned runtime",
-                ));
-            }
-            self.send_command_wait(
-                "set_model",
-                json!({"provider": desired_provider, "modelId": desired_model}),
-                COMMAND_TIMEOUT,
-            )?;
-            self.state = self
-                .send_command_wait("get_state", json!({}), COMMAND_TIMEOUT)?
-                .get("data")
-                .cloned()
-                .ok_or_else(|| protocol_error("OMP get_state response omitted data"))?;
+    pub(crate) fn ensure_model(&mut self, provider: &str, model: &str) -> Result<()> {
+        if model.is_empty() {
+            return Ok(());
         }
-
-        let (effective_provider, effective_model) = state_model(&self.state)?;
-        if effective_provider != desired_provider || effective_model != desired_model {
-            return Err(protocol_error(
-                "OMP effective provider/model differs from the selected allowlisted model",
-            ));
+        let (provider, model) = model.split_once('/').unwrap_or_else(|| {
+            let provider = if provider.is_empty() {
+                self.model
+                    .as_ref()
+                    .map(|model| model.provider.as_str())
+                    .unwrap_or_default()
+            } else {
+                provider
+            };
+            (provider, model)
+        });
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|current| current.provider == provider && current.id == model)
+        {
+            return Ok(());
         }
-        self.profile
-            .verify_allowed_model(&effective_provider, &effective_model)?;
-        self.profile.verify_state(&self.state)
-    }
-
-    fn initialize(
-        &mut self,
-        requested_provider: &str,
-        requested_model: &str,
-        resume: Option<&SessionMapping>,
-    ) -> Result<()> {
-        let ready_value = self.recv_required_frame(Instant::now() + STARTUP_TIMEOUT)?;
-        let ready = parse_ready(&ready_value)?;
-        self.decoder.set_limits_from_ready(&ready);
-        if ready.supported_protocol_versions.contains(&2) {
-            let response = self.send_command_wait(
-                "negotiate_protocol",
-                json!({"protocolVersion": 2}),
-                COMMAND_TIMEOUT,
-            )?;
-            if response
-                .get("data")
-                .and_then(|data| data.get("protocolVersion"))
-                .and_then(Value::as_u64)
-                != Some(2)
-            {
-                return Err(protocol_error(
-                    "OMP v2 negotiation returned the wrong version",
-                ));
-            }
-            self.decoder.enable_v2();
-        } else {
-            return Err(protocol_error("centaur-safe requires OMP protocol v2"));
-        }
-
-        if let Some(mapping) = resume {
-            self.send_command_wait(
-                "switch_session",
-                json!({"sessionPath": mapping.session_file}),
-                COMMAND_TIMEOUT,
-            )?;
-        }
-        self.send_command_wait("set_host_tools", json!({"tools": []}), COMMAND_TIMEOUT)?;
-        self.send_command_wait(
-            "set_host_uri_schemes",
-            json!({"schemes": []}),
-            COMMAND_TIMEOUT,
-        )?;
-        self.send_command_wait(
-            "set_subagent_subscription",
-            json!({"level": "off"}),
-            COMMAND_TIMEOUT,
-        )?;
-        self.send_command_wait(
-            "set_steering_mode",
-            json!({"mode": "one-at-a-time"}),
-            COMMAND_TIMEOUT,
-        )?;
-        self.send_command_wait(
-            "set_follow_up_mode",
-            json!({"mode": "one-at-a-time"}),
-            COMMAND_TIMEOUT,
-        )?;
-        self.send_command_wait(
-            "set_interrupt_mode",
-            json!({"mode": "immediate"}),
-            COMMAND_TIMEOUT,
-        )?;
-
-        self.state = self
-            .send_command_wait("get_state", json!({}), COMMAND_TIMEOUT)?
-            .get("data")
-            .cloned()
-            .ok_or_else(|| protocol_error("OMP get_state response omitted data"))?;
-
-        self.ensure_model(requested_provider, requested_model)?;
-
-        self.profile.verify_state(&self.state)?;
-        if let Some(mapping) = resume {
-            let resumed_session = self
-                .state
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| protocol_error("OMP resumed state omitted sessionId"))?;
-            let resumed_file = self
-                .state
-                .get("sessionFile")
-                .and_then(Value::as_str)
-                .ok_or_else(|| protocol_error("OMP resumed state omitted sessionFile"))?;
-            if resumed_session != mapping.session_id
-                || Path::new(resumed_file) != mapping.session_file
-            {
-                return Err(protocol_error("OMP resumed a different persisted session"));
-            }
-        }
-        self.persist_mapping()
-    }
-
-    fn persist_mapping(&self) -> Result<()> {
-        let session_id = self
-            .state
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| protocol_error("OMP state omitted sessionId"))?
-            .to_string();
-        let session_file = self
-            .state
-            .get("sessionFile")
-            .and_then(Value::as_str)
-            .ok_or_else(|| protocol_error("OMP state omitted sessionFile"))?;
-        let session_file =
-            validate_contained_session_path(self.profile.session_root(), Path::new(session_file))?;
-        persistence::save(
-            &self.profile,
-            &SessionMapping::new(&self.thread_id, session_id, session_file),
-        )
+        let fields = json!({"provider": provider, "modelId": model});
+        let response = self.send_command_wait("set_model", fields, COMMAND_TIMEOUT)?;
+        self.model = Some(serde_json::from_value(response.data)?);
+        Ok(())
     }
 
     fn send_command_wait(
@@ -566,7 +386,7 @@ impl OmpSession {
         command: &'static str,
         fields: Value,
         timeout: Duration,
-    ) -> Result<Value> {
+    ) -> Result<Response> {
         let id = self.command_id(command);
         let mut value = fields.as_object().cloned().unwrap_or_default();
         value.insert("id".to_string(), Value::String(id.clone()));
@@ -577,48 +397,35 @@ impl OmpSession {
             let frame = self.recv_required_frame(deadline)?;
             let kind = frame_type(&frame)?;
             if kind == "response" {
-                let response_id = frame.get("id").and_then(Value::as_str);
-                if let Some((expected, _)) =
-                    response_id.and_then(|id| self.pending_controls.remove(id))
-                {
-                    if frame.get("command").and_then(Value::as_str) != Some(expected)
-                        || frame.get("success").and_then(Value::as_bool).is_none()
-                    {
+                let response: Response = serde_json::from_value(frame)?;
+                if let Some((expected, _)) = self.pending_controls.remove(&response.id) {
+                    if response.command != expected {
                         return Err(protocol_error("OMP late control response mismatched"));
                     }
                     continue;
                 }
-                if response_id != Some(id.as_str()) {
+                if response.id != id || response.command != command {
                     return Err(protocol_error(format!(
-                        "OMP {command} received response for unexpected id"
+                        "OMP {command} received an unexpected response"
                     )));
                 }
-                if frame.get("command").and_then(Value::as_str) != Some(command) {
-                    return Err(protocol_error(format!(
-                        "OMP {command} response command mismatch"
-                    )));
-                }
-                if frame.get("success").and_then(Value::as_bool) != Some(true) {
+                if !response.success {
                     return Err(protocol_error(format!(
                         "OMP {command} failed: {}",
-                        bounded_error(frame.get("error").and_then(Value::as_str))
+                        bounded_error(response.error.as_deref())
                     )));
                 }
-                return Ok(frame);
+                return Ok(response);
             }
             if is_privileged_callback(kind) {
                 self.deny_callback(&frame)?;
-                continue;
-            }
-            if kind == "agent_end" {
+            } else if kind == "agent_end" {
                 if frame.get("isTerminal").and_then(Value::as_bool).is_none() {
                     return Err(protocol_error("OMP agent_end omitted boolean isTerminal"));
                 }
-                continue;
-            }
-            if !is_state_notification(kind) {
+            } else if !is_state_notification(kind) {
                 return Err(protocol_error(format!(
-                    "OMP emitted semantic frame {kind} while awaiting {command}"
+                    "OMP emitted event {kind} while awaiting {command}"
                 )));
             }
         }
@@ -660,14 +467,14 @@ impl OmpSession {
             "host_tool_call" => json!({
                 "type": "host_tool_result",
                 "id": id,
-                "result": {"content": [{"type": "text", "text": "Host tools are disabled by centaur-safe"}]},
+                "result": {"content": [{"type": "text", "text": "OMP host tools are not supported"}]},
                 "isError": true
             }),
             "host_uri_request" => json!({
                 "type": "host_uri_result",
                 "id": id,
                 "isError": true,
-                "error": "Host URIs are disabled by centaur-safe"
+                "error": "OMP host URIs are not supported"
             }),
             "host_tool_cancel" | "host_uri_cancel" => return Ok(()),
             _ => return Err(protocol_error("unknown privileged OMP callback")),
@@ -676,28 +483,21 @@ impl OmpSession {
     }
 
     fn recv_required_frame(&mut self, deadline: Instant) -> Result<Value> {
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(protocol_error("OMP frame wait timed out"));
-            }
-            match self.recv_frame(remaining)? {
-                Some(frame) => return Ok(frame),
-                None => continue,
-            }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(protocol_error("OMP frame wait timed out"));
         }
+        self.recv_frame(remaining)
     }
 
-    fn recv_frame(&mut self, timeout: Duration) -> Result<Option<Value>> {
+    fn recv_frame(&mut self, timeout: Duration) -> Result<Value> {
         match self.process.recv_timeout(timeout) {
             Ok(ProcessEvent::Frame(line)) => {
-                let frame = self.decoder.decode_line(&line)?;
-                if frame.as_ref().is_some_and(|frame| {
-                    frame.get("type").and_then(Value::as_str) == Some("notice")
-                        && frame.get("level").and_then(Value::as_str) == Some("error")
-                        && frame.get("source").and_then(Value::as_str)
-                            == Some("session-persistence")
-                }) {
+                let frame: Value = serde_json::from_slice(&line)?;
+                if frame.get("type").and_then(Value::as_str) == Some("notice")
+                    && frame.get("level").and_then(Value::as_str) == Some("error")
+                    && frame.get("source").and_then(Value::as_str) == Some("session-persistence")
+                {
                     return Err(protocol_error("OMP session persistence failed"));
                 }
                 Ok(frame)
@@ -732,30 +532,6 @@ impl OmpSession {
     }
 }
 
-pub(crate) fn load_resume_mapping(profile: &OmpProfile, thread_id: &str) -> Result<SessionMapping> {
-    persistence::load(profile, thread_id)?.ok_or_else(|| {
-        protocol_error(format!(
-            "OMP resume mapping for thread {thread_id} is unavailable"
-        ))
-    })
-}
-
-fn state_model(state: &Value) -> Result<(String, String)> {
-    let provider = state
-        .get("model")
-        .and_then(|model| model.get("provider"))
-        .and_then(Value::as_str)
-        .filter(|provider| !provider.is_empty())
-        .ok_or_else(|| protocol_error("OMP state omitted effective model provider"))?;
-    let model = state
-        .get("model")
-        .and_then(|model| model.get("id"))
-        .and_then(Value::as_str)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| protocol_error("OMP state omitted effective model id"))?;
-    Ok((provider.to_owned(), model.to_owned()))
-}
-
 fn is_privileged_callback(kind: &str) -> bool {
     matches!(
         kind,
@@ -786,11 +562,6 @@ fn prompt_content(input: &[UserInput]) -> Result<(String, Vec<Value>)> {
                 messages.push(format!("[mention: {name} at {path}]"));
             }
         }
-        if images.len() > MAX_IMAGES {
-            return Err(protocol_error(format!(
-                "OMP input exceeds the {MAX_IMAGES}-image limit"
-            )));
-        }
     }
     if messages.is_empty() {
         messages.push("Review the attached image.".to_string());
@@ -800,10 +571,8 @@ fn prompt_content(input: &[UserInput]) -> Result<(String, Vec<Value>)> {
 
 fn image_from_path(path: &Path) -> Result<Value> {
     let metadata = fs::metadata(path)?;
-    if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES {
-        return Err(protocol_error(format!(
-            "OMP image must be a regular file no larger than {MAX_IMAGE_BYTES} bytes"
-        )));
+    if !metadata.is_file() {
+        return Err(protocol_error("OMP image must be a regular file"));
     }
     let bytes = fs::read(path)?;
     let mime_type = image_mime(path)?;
@@ -827,14 +596,11 @@ fn image_from_data_url(url: &str) -> Result<Value> {
         return Err(protocol_error("OMP image data URL must use base64"));
     };
     if !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp") {
-        return Err(protocol_error("OMP image MIME type is not allowlisted"));
+        return Err(protocol_error("OMP image MIME type is unsupported"));
     }
-    let bytes = BASE64_STANDARD
-        .decode(data)
+    let mut decoded = base64::read::DecoderReader::new(data.as_bytes(), &BASE64_STANDARD);
+    std::io::copy(&mut decoded, &mut std::io::sink())
         .map_err(|error| protocol_error(format!("OMP image base64 is invalid: {error}")))?;
-    if bytes.len() as u64 > MAX_IMAGE_BYTES {
-        return Err(protocol_error("OMP image data exceeds its byte limit"));
-    }
     Ok(json!({"type": "image", "data": data, "mimeType": mime_type}))
 }
 
@@ -870,33 +636,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slow_chunked_command_response_obeys_one_deadline() {
+    fn command_notifications_do_not_extend_the_deadline() {
         let root = std::env::temp_dir().join(format!("omp-command-{}", uuid::Uuid::new_v4()));
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_omp_rpc.py");
-        let profile = OmpProfile::for_test(fixture, &root);
-        let mut session = OmpSession::start(
-            profile,
-            "deadline-test",
-            &root,
-            "anthropic",
-            "fake-model",
-            None,
+        let mut command = Command::new(fixture);
+        command.arg("--session-dir").arg(&root).arg("--continue");
+        let mut session = OmpSession {
+            process: OmpProcess::spawn(command, MAX_FRAME_BYTES).unwrap(),
+            next_id: 1,
+            pending_controls: HashMap::new(),
+            model: None,
+            normalizer: OmpEventNormalizer::default(),
+        };
+        parse_ready(
+            session
+                .recv_required_frame(Instant::now() + STARTUP_TIMEOUT)
+                .unwrap(),
         )
         .unwrap();
         let started = Instant::now();
         let result = session.send_command_wait(
             "get_state",
-            json!({"slowChunks": true}),
+            json!({"slowNotifications": true}),
             Duration::from_millis(200),
         );
         let elapsed = started.elapsed();
         drop(session);
         fs::remove_dir_all(root).unwrap();
-        assert!(
-            result.is_err(),
-            "slow chunks exceeded deadline but returned success"
-        );
         assert!(result.unwrap_err().to_string().contains("timed out"));
-        assert!(elapsed < Duration::from_secs(1), "elapsed: {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(700), "elapsed: {elapsed:?}");
     }
 }
