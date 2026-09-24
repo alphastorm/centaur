@@ -6,13 +6,15 @@ mod identifiers;
 mod models;
 mod tokens;
 
-use std::{env, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{env, net::SocketAddr, str::FromStr, sync::Arc, time::Instant};
 
 use active_record_encryption::{ActiveRecordEncryption, Error as EncryptionError};
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -23,7 +25,6 @@ use models::{AppState, Config};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use url::Url;
 
@@ -127,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/api/v1/proxy/sync", post(sync))
-        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(log_request))
         .with_state(state);
     let bind: SocketAddr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
@@ -142,6 +143,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn log_request(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    info!(
+        component = "proxy_sync",
+        event = "http_request",
+        method = %method,
+        path,
+        status = response.status().as_u16(),
+        duration_ms = started_at.elapsed().as_secs_f64() * 1000.0,
+    );
+    response
 }
 
 async fn sync(
