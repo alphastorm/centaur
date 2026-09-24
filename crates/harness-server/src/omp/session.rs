@@ -27,6 +27,7 @@ const ABORT_GRACE: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_IMAGES: usize = 8;
 const MAX_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PENDING_CONTROLS: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) enum TurnControl {
@@ -45,6 +46,7 @@ pub(crate) struct OmpSession {
     process: StatefulProcess,
     decoder: Decoder,
     next_id: u64,
+    pending_controls: HashMap<String, (&'static str, u64)>,
     thread_id: String,
     state: Value,
     normalizer: OmpEventNormalizer,
@@ -66,6 +68,7 @@ impl OmpSession {
             process,
             decoder: Decoder::default(),
             next_id: 1,
+            pending_controls: HashMap::new(),
             thread_id: thread_id.to_string(),
             state: Value::Null,
             normalizer: OmpEventNormalizer::default(),
@@ -76,6 +79,10 @@ impl OmpSession {
 
     pub(crate) fn state(&self) -> &Value {
         &self.state
+    }
+
+    pub(crate) fn has_exited(&mut self) -> Result<bool> {
+        Ok(self.process.try_wait()?.is_some())
     }
 
     pub(crate) fn run_turn<F, C>(
@@ -89,6 +96,7 @@ impl OmpSession {
         C: FnMut() -> Result<Option<TurnControl>>,
     {
         let (message, images) = prompt_content(input)?;
+        let turn_sequence = self.next_id;
         let prompt_id = self.command_id("prompt");
         let mut prompt = json!({
             "id": prompt_id.clone(),
@@ -106,11 +114,15 @@ impl OmpSession {
         let mut terminal_seen = false;
         let mut interrupted = false;
         let mut abort_deadline = None;
-        let mut pending_controls: HashMap<String, &'static str> = HashMap::new();
         let mut usage = None;
 
         loop {
             while let Some(control) = poll_control()? {
+                if !interrupted && self.pending_controls.len() >= MAX_PENDING_CONTROLS {
+                    return Err(protocol_error(
+                        "OMP pending control response limit exceeded",
+                    ));
+                }
                 match control {
                     TurnControl::Steer(input) if !interrupted => {
                         let (message, images) = prompt_content(&input)?;
@@ -120,14 +132,14 @@ impl OmpSession {
                             command["images"] = Value::Array(images);
                         }
                         self.process.write_json(&command)?;
-                        pending_controls.insert(id, "steer");
+                        self.pending_controls.insert(id, ("steer", turn_sequence));
                     }
                     TurnControl::Interrupt if !interrupted => {
                         interrupted = true;
                         let id = self.command_id("abort");
                         self.process
                             .write_json(&json!({"id": id, "type": "abort"}))?;
-                        pending_controls.insert(id, "abort");
+                        self.pending_controls.insert(id, ("abort", turn_sequence));
                         abort_deadline = Some(Instant::now() + ABORT_GRACE);
                     }
                     TurnControl::Steer(_) | TurnControl::Interrupt => {}
@@ -200,12 +212,15 @@ impl OmpSession {
                     }
                     continue;
                 }
-                let Some(expected) = pending_controls.remove(id) else {
+                let Some((expected, issued_turn)) = self.pending_controls.remove(id) else {
                     return Err(protocol_error(format!(
                         "OMP emitted response for unknown active-turn id {id}"
                     )));
                 };
-                if command != expected || !success {
+                // A terminal event can precede its control acknowledgement. Keep
+                // correlation across turns, but never fail a later turn for a
+                // control that belonged to an already completed turn.
+                if command != expected || (issued_turn == turn_sequence && !success) {
                     return Err(protocol_error(format!(
                         "OMP {expected} response failed or mismatched"
                     )));
@@ -463,6 +478,16 @@ impl OmpSession {
             let kind = frame_type(&frame)?;
             if kind == "response" {
                 let response_id = frame.get("id").and_then(Value::as_str);
+                if let Some((expected, _)) =
+                    response_id.and_then(|id| self.pending_controls.remove(id))
+                {
+                    if frame.get("command").and_then(Value::as_str) != Some(expected)
+                        || frame.get("success").and_then(Value::as_bool).is_none()
+                    {
+                        return Err(protocol_error("OMP late control response mismatched"));
+                    }
+                    continue;
+                }
                 if response_id != Some(id.as_str()) {
                     return Err(protocol_error(format!(
                         "OMP {command} received response for unexpected id"
@@ -598,7 +623,11 @@ impl OmpSession {
 }
 
 pub(crate) fn load_resume_mapping(profile: &OmpProfile, thread_id: &str) -> Result<SessionMapping> {
-    persistence::load(profile, thread_id)
+    persistence::load(profile, thread_id)?.ok_or_else(|| {
+        protocol_error(format!(
+            "OMP resume mapping for thread {thread_id} is unavailable"
+        ))
+    })
 }
 
 fn state_model(state: &Value) -> Result<(String, String)> {

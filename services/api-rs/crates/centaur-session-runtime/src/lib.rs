@@ -1406,6 +1406,7 @@ impl SessionRuntime {
             .warm_harness
             .clone()
             .unwrap_or(HarnessType::Codex);
+        enforce_harness_rollout(thread_key, &harness)?;
         let metadata =
             tool_host_session_metadata(principal_id, console_user_email, console_user_name);
         let session = self
@@ -1778,6 +1779,7 @@ impl SessionRuntime {
         principal_foreign_id: Option<&str>,
         admission: SessionPrincipalAdmission,
     ) -> Result<CreateOrGetSessionOutcome, SessionRuntimeError> {
+        enforce_harness_rollout(thread_key, harness_type)?;
         let principal_foreign_id = match principal_foreign_id {
             Some(foreign_id) if foreign_id.trim().is_empty() => {
                 return Err(SessionRuntimeError::BadRequest(
@@ -6341,6 +6343,7 @@ fn execution_duration(execution: &SessionExecution) -> Option<Duration> {
 fn runtime_error_failure_class(error: &SessionRuntimeError) -> &'static str {
     match error {
         SessionRuntimeError::BadRequest(_) => "bad_request",
+        SessionRuntimeError::Forbidden(_) => "forbidden",
         SessionRuntimeError::ShuttingDown => "shutting_down",
         SessionRuntimeError::Store(_) => "store",
         SessionRuntimeError::Sandbox(SandboxError::NotFound(_)) => "sandbox_not_found",
@@ -7573,10 +7576,52 @@ fn terminal_output_from_lines(lines: &[String]) -> Option<TerminalOutput> {
     None
 }
 
+fn enforce_harness_rollout(
+    thread_key: &ThreadKey,
+    harness: &HarnessType,
+) -> Result<(), SessionRuntimeError> {
+    if *harness != HarnessType::Omp {
+        return Ok(());
+    }
+    enforce_omp_rollout(
+        thread_key.as_ref(),
+        std::env::var("CENTAUR_OMP_ENABLED").as_deref() == Ok("1"),
+        std::env::var("CENTAUR_OMP_THREAD_ALLOWLIST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn enforce_omp_rollout(
+    thread_key: &str,
+    enabled: bool,
+    allowlist: Option<&str>,
+) -> Result<(), SessionRuntimeError> {
+    if !enabled {
+        return Err(SessionRuntimeError::Forbidden(
+            "OMP harness rollout is disabled".to_owned(),
+        ));
+    }
+    let allowed = allowlist.is_some_and(|entries| {
+        entries
+            .split(',')
+            .map(str::trim)
+            .any(|entry| !entry.is_empty() && entry == thread_key)
+    });
+    if !allowed {
+        return Err(SessionRuntimeError::Forbidden(
+            "thread is not allowlisted for the OMP harness".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum SessionRuntimeError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error("control plane is shutting down")]
     ShuttingDown,
     #[error(transparent)]
@@ -7604,6 +7649,23 @@ mod tests {
     use centaur_session_core::SessionStatus;
     use serde_json::json;
     use time::OffsetDateTime;
+
+    #[test]
+    fn omp_rollout_requires_feature_flag_and_exact_thread_allowlist() {
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", false, Some("slack:C1:1.0")),
+            Err(SessionRuntimeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", true, None),
+            Err(SessionRuntimeError::Forbidden(_))
+        ));
+        assert!(matches!(
+            enforce_omp_rollout("slack:C1:1.0", true, Some("slack:C1:1.00")),
+            Err(SessionRuntimeError::Forbidden(_))
+        ));
+        enforce_omp_rollout("slack:C1:1.0", true, Some("slack:C2:2.0, slack:C1:1.0")).unwrap();
+    }
 
     #[test]
     fn sandbox_repo_cache_label_controls_access() {
@@ -9865,6 +9927,80 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    #[test]
+    fn omp_tool_host_creation_obeys_rollout() {
+        if std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL").is_err() {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return;
+        }
+        let Ok(case) = std::env::var("CENTAUR_TEST_OMP_ROLLOUT_CASE") else {
+            let _serial = TEST_LOCK.blocking_lock();
+            for (case, enabled, allowlisted) in [
+                ("disabled", "0", true),
+                ("not-allowlisted", "1", false),
+                ("allowed", "1", true),
+            ] {
+                let thread = format!("mcp:omp_{}", uuid::Uuid::new_v4());
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "adoption_tests::omp_tool_host_creation_obeys_rollout",
+                        "--nocapture",
+                    ])
+                    .env("CENTAUR_TEST_OMP_ROLLOUT_CASE", case)
+                    .env("CENTAUR_TEST_OMP_THREAD", &thread)
+                    .env("CENTAUR_OMP_ENABLED", enabled)
+                    .env(
+                        "CENTAUR_OMP_THREAD_ALLOWLIST",
+                        if allowlisted {
+                            thread.clone()
+                        } else {
+                            format!("{thread}-other")
+                        },
+                    )
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "tool-host OMP admission case {case}");
+            }
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let store = test_store().await.unwrap();
+                let thread_key =
+                    ThreadKey::parse(std::env::var("CENTAUR_TEST_OMP_THREAD").unwrap()).unwrap();
+                let mut runtime = runtime_with(
+                    &store,
+                    Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new())),
+                );
+                runtime.sandbox_runtime.warm_harness = Some(HarnessType::Omp);
+                let result = runtime
+                    .create_or_get_tool_host_session(&thread_key, "prn_test", None, None)
+                    .await;
+                if case == "allowed" {
+                    result.unwrap();
+                    assert_eq!(
+                        store.get_session(&thread_key).await.unwrap().harness_type,
+                        HarnessType::Omp
+                    );
+                } else {
+                    assert!(matches!(result, Err(SessionRuntimeError::Forbidden(_))));
+                    assert!(matches!(
+                        store.get_session(&thread_key).await,
+                        Err(SessionStoreError::NotFound { .. })
+                    ));
+                }
+                sqlx::query("delete from sessions where thread_key = $1")
+                    .bind(thread_key.as_str())
+                    .execute(store.pool())
+                    .await
+                    .unwrap();
+            });
     }
 
     fn runtime_with_personas(store: &PgSessionStore, backend: Arc<MockBackend>) -> SessionRuntime {

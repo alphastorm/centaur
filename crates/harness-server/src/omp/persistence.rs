@@ -67,14 +67,14 @@ pub(crate) fn save(profile: &OmpProfile, mapping: &SessionMapping) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn load(profile: &OmpProfile, thread_id: &str) -> Result<SessionMapping> {
+pub(crate) fn load(profile: &OmpProfile, thread_id: &str) -> Result<Option<SessionMapping>> {
     let path = mapping_path(profile, thread_id);
     reject_symlink_if_present(&path)?;
-    let metadata = fs::metadata(&path).map_err(|error| {
-        protocol_error(format!(
-            "OMP resume mapping for thread {thread_id} is unavailable: {error}"
-        ))
-    })?;
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     if !metadata.is_file() || metadata.len() > MAX_MAPPING_BYTES {
         return Err(protocol_error(
             "OMP resume mapping is not a bounded regular file",
@@ -90,7 +90,7 @@ pub(crate) fn load(profile: &OmpProfile, thread_id: &str) -> Result<SessionMappi
     let mapping: SessionMapping = serde_json::from_slice(&bytes)
         .map_err(|error| protocol_error(format!("OMP resume mapping is invalid: {error}")))?;
     validate_mapping(profile, thread_id, &mapping)?;
-    Ok(mapping)
+    Ok(Some(mapping))
 }
 
 fn validate_mapping(

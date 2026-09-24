@@ -168,6 +168,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn omp_create_and_switch_obey_rollout() {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return;
+        };
+        let Ok(case) = std::env::var("CENTAUR_TEST_OMP_ROLLOUT_CASE") else {
+            for (case, enabled, allowlisted) in [
+                ("disabled", "0", true),
+                ("not-allowlisted", "1", false),
+                ("allowed", "1", true),
+            ] {
+                let thread = format!("test:api-omp:{}", uuid::Uuid::new_v4());
+                let status = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::omp_create_and_switch_obey_rollout",
+                        "--nocapture",
+                    ])
+                    .env("CENTAUR_TEST_OMP_ROLLOUT_CASE", case)
+                    .env("CENTAUR_TEST_OMP_THREAD", &thread)
+                    .env("CENTAUR_OMP_ENABLED", enabled)
+                    .env(
+                        "CENTAUR_OMP_THREAD_ALLOWLIST",
+                        if allowlisted {
+                            format!("{thread},{thread}-switch")
+                        } else {
+                            format!("{thread}-other")
+                        },
+                    )
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "API OMP admission case {case}");
+            }
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let store = PgSessionStore::connect(&url).await.unwrap();
+            store.run_migrations().await.unwrap();
+            let app = build_router_with_runtime(store.clone(), SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")));
+            for restart in [false, true] {
+                let thread = std::env::var("CENTAUR_TEST_OMP_THREAD").unwrap() + if restart { "-switch" } else { "" };
+                let thread_key = centaur_session_core::ThreadKey::parse(thread.clone()).unwrap();
+                if restart {
+                    store.create_or_get_session(&thread_key, &centaur_session_core::HarnessType::Codex, None, json!({}), Default::default()).await.unwrap();
+                }
+                let response = app.clone().oneshot(Request::builder()
+                    .method(Method::POST).uri(format!("/api/session/{thread}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({"harness_type": "omp", "on_harness_conflict": "restart"}).to_string())).unwrap())
+                    .await.unwrap();
+                assert_eq!(response.status(), if case == "allowed" { StatusCode::OK } else { StatusCode::FORBIDDEN });
+                let session = store.get_session(&thread_key).await;
+                if case == "allowed" {
+                    assert_eq!(session.unwrap().harness_type, centaur_session_core::HarnessType::Omp);
+                } else if restart {
+                    assert_eq!(session.unwrap().harness_type, centaur_session_core::HarnessType::Codex);
+                } else {
+                    assert!(matches!(session, Err(centaur_session_sqlx::SessionStoreError::NotFound { .. })));
+                }
+                sqlx::query("delete from sessions where thread_key = $1").bind(thread_key.as_str()).execute(store.pool()).await.unwrap();
+            }
+        });
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_renders_http_request_metrics() {
         let pool =

@@ -27,14 +27,18 @@ chunk_seq = 0
 last_assistant_text = ""
 session_root = pathlib.Path(os.environ.get("PI_CODING_AGENT_DIR", "/tmp/fake-omp"))
 session_root.mkdir(parents=True, exist_ok=True)
-session_id = "fake-session-1"
-session_file = str(session_root / "fake-session-1.jsonl")
+session_id = f"fake-session-{uuid.uuid4().hex}"
+session_file = str(session_root / f"{session_id}.jsonl")
 pathlib.Path(session_file).touch()
-model = {"provider": "fake", "id": "fake-model"}
+model = {"provider": "anthropic", "id": "fake-model"}
 abort_event = threading.Event()
 pending_ui: str | None = None
 pending_host_tool: str | None = None
+pending_host_uri: str | None = None
 steer_event = threading.Event()
+ignore_abort = False
+late_control = False
+silent_controls = False
 
 
 def raw_line(data: bytes) -> None:
@@ -107,7 +111,7 @@ def current_state() -> dict[str, Any]:
 
 def assistant_events(text: str, *, nonterminal: bool = False,
                      include_tool: bool = False, include_reasoning: bool = False,
-                     force_chunk: bool = False) -> None:
+                     force_chunk: bool = False, wait_for_interrupt: bool = False) -> None:
     global last_assistant_text
     message_id = f"msg-{uuid.uuid4().hex[:8]}"
     emit({"type": "agent_start"})
@@ -143,6 +147,8 @@ def assistant_events(text: str, *, nonterminal: bool = False,
     }})
     last_assistant_text = text
     emit({"type": "turn_end", "message": {}, "toolResults": []})
+    if wait_for_interrupt:
+        abort_event.wait(timeout=30)
     if nonterminal:
         emit({"type": "agent_end", "isTerminal": False,
               "messages": [], "reason": "async-delivery-pending"})
@@ -177,9 +183,13 @@ def wait_for_steer(request_id: str | None) -> None:
 
 
 def handle_prompt(cmd: dict[str, Any]) -> None:
-    global pending_ui, pending_host_tool, last_assistant_text
+    global pending_ui, pending_host_tool, pending_host_uri, last_assistant_text
+    global ignore_abort, late_control, silent_controls
     request_id = cmd.get("id")
     message = str(cmd.get("message", ""))
+    ignore_abort = "__ignore_abort__" in message
+    late_control = "__late_abort__" in message or "__late_steer__" in message
+    silent_controls = "__silent_controls__" in message
     if "__local__" in message:
         emit({"type": "command_output", "id": request_id, "command": "/fake",
               "output": "local command completed"})
@@ -208,6 +218,18 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
     elif "__persistence_error__" in message:
         emit({"type": "notice", "level": "error", "source": "session-persistence",
               "message": "private-store-path: write failed"})
+    elif "__notice_error__" in message or "__retry_error__" in message or "__extension_error__" in message:
+        if "__notice_error__" in message:
+            emit({"type": "notice", "level": "error", "message": "fake notice failure"})
+        elif "__retry_error__" in message:
+            emit({"type": "auto_retry_end", "success": False, "finalError": "fake retry failure"})
+        else:
+            emit({"type": "extension_error", "message": "fake extension failure"})
+        emit({"type": "agent_end", "isTerminal": True, "messages": []})
+    elif "__answer_then_abort__" in message:
+        abort_event.clear()
+        threading.Thread(target=delayed_normal, args=("answer before abort",),
+                         kwargs={"wait_for_interrupt": True}, daemon=True).start()
     elif "__ui_select__" in message:
         pending_ui = f"ui-{uuid.uuid4().hex[:8]}"
         emit({"type": "extension_ui_request", "id": "cancel-notification",
@@ -236,6 +258,10 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
     elif "Attached file saved to" in message:
         threading.Thread(target=delayed_normal,
                          args=("document path accepted",), daemon=True).start()
+    elif "__unknown_control__" in message:
+        response("steer", "centaur-steer-never-issued", data={"queued": True})
+    elif ignore_abort or late_control or silent_controls:
+        emit({"type": "agent_start"})
     elif "__hang__" in message:
         abort_event.clear()
         threading.Thread(target=wait_for_abort, daemon=True).start()
@@ -247,15 +273,20 @@ def handle_prompt(cmd: dict[str, Any]) -> None:
         pending_host_tool = f"host-{uuid.uuid4().hex[:8]}"
         emit({"type": "host_tool_call", "id": pending_host_tool,
               "toolCallId": "fake-call", "toolName": "fake_host", "arguments": {"value": 1}})
+    elif "__host_uri__" in message:
+        pending_host_uri = f"uri-{uuid.uuid4().hex[:8]}"
+        emit({"type": "host_uri_request", "id": pending_host_uri, "uri": "private://fixture"})
     elif "__malformed__" in message:
         raw_line(b"THIS IS NOT JSON")
     else:
         threading.Thread(target=delayed_normal,
-                         args=(f"fake response pid={os.getpid()}",), daemon=True).start()
+                         args=(f"fake response pid={os.getpid()} session={session_id}",),
+                         daemon=True).start()
 
 
 def handle(cmd: dict[str, Any]) -> None:
     global protocol_version, session_id, session_file, model, pending_ui, pending_host_tool
+    global pending_host_uri
     typ = cmd.get("type")
     request_id = cmd.get("id")
     if typ == "negotiate_protocol":
@@ -271,7 +302,8 @@ def handle(cmd: dict[str, Any]) -> None:
         response("get_state", request_id, data=current_state())
     elif typ == "get_available_models":
         response("get_available_models", request_id,
-                 data={"models": [{"provider": "fake", "id": "fake-model"}]})
+                 data={"models": [{"provider": "anthropic", "id": name}
+                                  for name in ("fake-model", "fake-model-2")]})
     elif typ == "set_model":
         model = {"provider": str(cmd.get("provider")), "id": str(cmd.get("modelId"))}
         response("set_model", request_id, data=model.copy())
@@ -281,14 +313,24 @@ def handle(cmd: dict[str, Any]) -> None:
         response(str(typ), request_id, data={})
     elif typ == "switch_session":
         session_file = str(cmd.get("sessionPath"))
+        session_id = pathlib.Path(session_file).stem
         pathlib.Path(session_file).touch(exist_ok=True)
         response("switch_session", request_id, data={"cancelled": False})
     elif typ == "prompt":
         handle_prompt(cmd)
     elif typ == "steer":
+        if silent_controls:
+            return
+        if late_control:
+            assistant_events("steered before acknowledgement")
         response("steer", request_id, data={"queued": True})
         steer_event.set()
     elif typ == "abort":
+        if ignore_abort:
+            return
+        if late_control:
+            emit({"type": "agent_end", "isTerminal": True,
+                  "messages": [], "reason": "aborted"})
         response("abort", request_id, data={"aborted": True})
         abort_event.set()
     elif typ == "extension_ui_response":
@@ -302,6 +344,10 @@ def handle(cmd: dict[str, Any]) -> None:
         if cmd.get("id") == pending_host_tool:
             pending_host_tool = None
             emit({"type": "agent_end", "isTerminal": True, "messages": [], "reason": "host-tool-rejected"})
+    elif typ == "host_uri_result":
+        if cmd.get("id") == pending_host_uri and cmd.get("isError") is True:
+            pending_host_uri = None
+            emit({"type": "agent_end", "isTerminal": True, "messages": [], "reason": "host-uri-rejected"})
     else:
         response(str(typ or "parse"), request_id, success=False, error="unknown fake command")
 

@@ -4618,6 +4618,114 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    #[derive(Clone, Copy)]
+    struct OmpTestRegistrar;
+
+    #[async_trait::async_trait]
+    impl centaur_session_runtime::SessionPrincipalRegistrar for OmpTestRegistrar {
+        async fn register_session(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<centaur_iron_control::Principal, IronControlError> {
+            self.get_principal("prn_omp_test").await
+        }
+
+        async fn register_requester(
+            &self,
+            _thread_key: &str,
+            _metadata: Option<&Value>,
+            _create_if_missing: bool,
+        ) -> Result<Option<centaur_iron_control::Principal>, IronControlError> {
+            Ok(None)
+        }
+
+        async fn get_principal(
+            &self,
+            id: &str,
+        ) -> Result<centaur_iron_control::Principal, IronControlError> {
+            Ok(centaur_iron_control::Principal {
+                id: id.to_owned(),
+                foreign_id: Some("omp-test".to_owned()),
+                name: "OMP test".to_owned(),
+                labels: BTreeMap::new(),
+                sandbox_observability_enabled: true,
+            })
+        }
+    }
+
+    #[test]
+    fn omp_agent_turn_override_obeys_rollout() {
+        let Ok(url) = env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return;
+        };
+        let Ok(case) = env::var("CENTAUR_TEST_OMP_ROLLOUT_CASE") else {
+            for (case, enabled, allowlisted) in [
+                ("disabled", "0", true),
+                ("not-allowlisted", "1", false),
+                ("allowed", "1", true),
+            ] {
+                let thread = format!("test:workflow-omp:{}", uuid::Uuid::new_v4());
+                let status = std::process::Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::omp_agent_turn_override_obeys_rollout",
+                        "--nocapture",
+                    ])
+                    .env("CENTAUR_TEST_OMP_ROLLOUT_CASE", case)
+                    .env("CENTAUR_TEST_OMP_THREAD", &thread)
+                    .env("CENTAUR_OMP_ENABLED", enabled)
+                    .env(
+                        "CENTAUR_OMP_THREAD_ALLOWLIST",
+                        if allowlisted {
+                            thread.clone()
+                        } else {
+                            format!("{thread}-other")
+                        },
+                    )
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "workflow OMP admission case {case}");
+            }
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let store = PgSessionStore::connect(&url).await.unwrap();
+            store.run_migrations().await.unwrap();
+            let thread = env::var("CENTAUR_TEST_OMP_THREAD").unwrap();
+            let thread_key = ThreadKey::parse(thread.clone()).unwrap();
+            let sandbox = SandboxRuntime::backend(
+                Arc::new(centaur_sandbox_local::LocalSandboxBackend::new()),
+                SandboxSpec::new("/bin/sh").command(["/bin/sh", "-c"]).args([
+                    "while IFS= read -r line; do printf '%s\n' '{\"type\":\"turn.completed\",\"turn\":{\"id\":\"turn-test\",\"status\":\"completed\"}}'; done",
+                ]),
+            );
+            let runtime = SessionRuntime::new(store.clone(), sandbox.clone(), OmpTestRegistrar);
+            let harness_type = parse_agent_harness(&json!({"harness": "omp"})).unwrap().unwrap();
+            let result = run_agent_session_turn(runtime, AgentTurnRequest {
+                thread_key: thread, harness_type, persona_id: None, principal_foreign_id: None,
+                parts: vec![json!({"type": "text", "text": "provider-free admission probe"})],
+                client_message_id: "message-1".to_owned(), session_metadata: json!({}),
+                message_metadata: json!({}), execution_metadata: json!({}),
+                execution_idempotency_key: "execution-1".to_owned(), workflow_owned_thread: true,
+                idle_timeout_ms: 10_000, max_duration_ms: 20_000,
+                model: None, provider: None, reasoning: None,
+            }).await;
+            if case == "allowed" {
+                assert_eq!(result.unwrap().status, "completed");
+                let session = store.get_session(&thread_key).await.unwrap();
+                assert_eq!(session.harness_type, HarnessType::Omp);
+                sandbox.stop_sandbox(&centaur_sandbox_core::SandboxId::new(session.sandbox_id.unwrap())).await.unwrap();
+            } else {
+                assert!(matches!(result, Err(WorkflowRuntimeError::SessionRuntime(centaur_session_runtime::SessionRuntimeError::Forbidden(_)))));
+                assert!(matches!(store.get_session(&thread_key).await, Err(centaur_session_sqlx::SessionStoreError::NotFound { .. })));
+            }
+            sqlx::query("delete from sessions where thread_key = $1").bind(thread_key.as_str()).execute(store.pool()).await.unwrap();
+        });
+    }
+
     async fn assert_structured_host_error_is_bounded(message_type: &str) {
         let stderr_task = tokio::spawn(async {
             std::future::pending::<()>().await;

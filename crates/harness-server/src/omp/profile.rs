@@ -269,6 +269,11 @@ fn parse_allowed_model_list(raw: &str) -> Result<BTreeSet<(String, String)>> {
                 "OMP allowlist contains an invalid provider/model",
             ));
         }
+        if provider != "anthropic" {
+            return Err(protocol_error(
+                "OMP centaur-safe supports only the anthropic provider through the Claude Code credential proxy",
+            ));
+        }
         models.insert((provider.to_owned(), model.to_owned()));
     }
     if models.is_empty() {
@@ -332,12 +337,20 @@ mod tests {
     #[test]
     fn parses_exact_operator_model_allowlist() {
         let models =
-            parse_allowed_model_list("anthropic/claude-sonnet-4-5,openrouter/anthropic/claude")
+            parse_allowed_model_list("anthropic/claude-sonnet-4-5,anthropic/claude-opus-4-6")
                 .unwrap();
         assert!(models.contains(&("anthropic".to_owned(), "claude-sonnet-4-5".to_owned())));
-        assert!(models.contains(&("openrouter".to_owned(), "anthropic/claude".to_owned())));
+        assert!(models.contains(&("anthropic".to_owned(), "claude-opus-4-6".to_owned())));
         assert!(parse_allowed_model_list("anthropic").is_err());
         assert!(parse_allowed_model_list("anthropic/claude sonnet").is_err());
         assert!(parse_allowed_model_list("").is_err());
+    }
+
+    #[test]
+    fn rejects_provider_without_credential_proxy() {
+        let error = parse_allowed_model_list("anthropic/claude-sonnet-4-5,openai/gpt-test")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only the anthropic provider"));
     }
 }
