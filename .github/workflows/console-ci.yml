@@ -46,7 +46,7 @@ jobs:
           fi
 
   scan_ruby:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -64,7 +64,7 @@ jobs:
         run: bin/brakeman --no-pager
 
   scan_js:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
@@ -82,7 +82,7 @@ jobs:
         run: bin/importmap audit
 
   lint:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
     env:
@@ -111,7 +111,7 @@ jobs:
         run: bin/rubocop -f github
 
   test:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: console_changes
     if: needs.console_changes.outputs.relevant == 'true'
 
