@@ -26,7 +26,7 @@ use centaur_iron_proxy::{
 };
 use centaur_sandbox_agent_k8s::{
     AgentSandboxBackend, AgentSandboxConfig, GitHubTokenRef, IronControlSettings, IronProxyConfig,
-    OtlpEgressTarget, Toleration, ToolSource, ToolsConfig,
+    OtlpEgressTarget, StateVolumeConfig, Toleration, ToolSource, ToolsConfig,
 };
 use centaur_sandbox_core::{Mount, MountKind, ResourceRequirements, SandboxSpec};
 use centaur_sandbox_local::LocalSandboxBackend;
@@ -686,6 +686,24 @@ struct SandboxArgs {
     /// into this because api-rs creates these pods at runtime.
     #[arg(long = "session-sandbox-resources", env = "SESSION_SANDBOX_RESOURCES")]
     sandbox_resources_json: Option<String>,
+    #[arg(
+        long = "session-sandbox-state-volume-enabled",
+        env = "SESSION_SANDBOX_STATE_VOLUME_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set
+    )]
+    state_volume_enabled: bool,
+    #[arg(
+        long = "session-sandbox-state-volume-size",
+        env = "SESSION_SANDBOX_STATE_VOLUME_SIZE",
+        default_value = "10Gi"
+    )]
+    state_volume_size: String,
+    #[arg(
+        long = "session-sandbox-state-volume-storage-class-name",
+        env = "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME"
+    )]
+    state_volume_storage_class_name: Option<String>,
     #[arg(
         long = "session-sandbox-ready-timeout-secs",
         alias = "kubernetes-sandbox-ready-timeout-s",
@@ -1653,6 +1671,14 @@ impl TryFrom<&SandboxArgs> for AgentSandboxConfig {
         let mut config =
             AgentSandboxConfig::new(args.k8s_namespace.clone(), args.iron_control.settings()?);
         config.image_pull_policy = args.agent_image_pull_policy.clone();
+        if args.state_volume_enabled {
+            // The sandbox entrypoint persists native harness state here.
+            let mut state_volume =
+                StateVolumeConfig::new("/home/agent/state", args.state_volume_size.clone());
+            state_volume.storage_class_name =
+                clean_optional_value(args.state_volume_storage_class_name.as_deref());
+            config = config.state_volume(state_volume);
+        }
         config.image_pull_secrets = args
             .image_pull_secrets
             .iter()
@@ -2701,6 +2727,75 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn session_sandbox_state_volume_requires_opt_in() {
+        for flags in [
+            vec![],
+            vec![
+                "--session-sandbox-state-volume-enabled",
+                "false",
+                "--session-sandbox-state-volume-size",
+                "2Gi",
+                "--session-sandbox-state-volume-storage-class-name",
+                "fast",
+            ],
+        ] {
+            let args = Args::try_parse_from(
+                [
+                    "centaur-api-server",
+                    "--database-url",
+                    "postgres://postgres:postgres@localhost/centaur",
+                    "--iron-control-url",
+                    "http://console.local",
+                    "--iron-control-proxy-sync-url",
+                    "http://proxy-sync.local:8080",
+                    "--iron-control-api-key",
+                    "iak_test",
+                ]
+                .into_iter()
+                .chain(flags),
+            )
+            .unwrap();
+
+            let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+            assert_eq!(config.state_volume, None);
+        }
+    }
+
+    #[test]
+    fn parses_session_sandbox_state_volume() {
+        for (storage_class, expected) in [("", None), ("fast", Some("fast"))] {
+            let args = Args::try_parse_from([
+                "centaur-api-server",
+                "--database-url",
+                "postgres://postgres:postgres@localhost/centaur",
+                "--iron-control-url",
+                "http://console.local",
+                "--iron-control-proxy-sync-url",
+                "http://proxy-sync.local:8080",
+                "--iron-control-api-key",
+                "iak_test",
+                "--session-sandbox-state-volume-enabled",
+                "true",
+                "--session-sandbox-state-volume-size",
+                "2Gi",
+                "--session-sandbox-state-volume-storage-class-name",
+                storage_class,
+            ])
+            .unwrap();
+
+            let config = AgentSandboxConfig::try_from(&args.sandbox).unwrap();
+            assert_eq!(
+                config.state_volume,
+                Some(StateVolumeConfig {
+                    mount_path: "/home/agent/state".to_owned(),
+                    size: "2Gi".to_owned(),
+                    storage_class_name: expected.map(str::to_owned),
+                })
+            );
+        }
     }
 
     #[test]

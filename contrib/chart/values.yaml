@@ -348,9 +348,14 @@ sandbox:
     # Token usage, cost, status, session, and tool telemetry remain available
     # when this is disabled.
     captureTranscripts: false
+  # New agent-k8s sandboxes get a ReadWriteOnce PVC at /home/agent/state. The
+  # entrypoint keeps the session's workspace clone, uploads, branches, and native
+  # Codex/Claude files there, so they survive idle pause and pod replacement, but
+  # not final sandbox deletion. Existing sandboxes/claims are not migrated.
   stateVolume:
     enabled: false
     size: 10Gi
+    # Empty uses the cluster default storage class.
     storageClassName: ""
   # Requests/limits for the agent container of every sandbox pod, per-session
   # and warm (k8s resources map).
