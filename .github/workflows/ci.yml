@@ -497,7 +497,7 @@ jobs:
 
   rust-api-postgres:
     name: Rust API migrations on PostgreSQL
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
