@@ -9,8 +9,12 @@ secretManager:
   existingSecretName: centaur-infra-env
 
 firewall:
+  # Name fields select Kubernetes Secrets (they may be the same Secret); Key
+  # fields select the PEM entries inside them.
   existingCaSecretName: centaur-firewall-ca
+  existingCaSecretKey: ca-cert.pem
   existingCaKeySecretName: centaur-firewall-ca-key
+  existingCaKeySecretKey: ca-key.pem
   ca:
     certPem: ""
     keyPem: ""
@@ -338,9 +342,9 @@ sandbox:
   # matters for containers started outside api-rs.
   harnessEngine: codex
   # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here are also
-  # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT is
-  # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
-  # with the policy the sandbox actually runs.
+  # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT and
+  # CENTAUR_PI_MODEL are mirrored into slackbotv2. This keeps Slack's
+  # model/thinking footer aligned with the policy the sandbox actually runs.
   extraEnv: {}
   telemetry:
     # Include user prompts, assistant responses, and bounded shell commands on
@@ -702,18 +706,20 @@ slackbotv2:
   mcpPublicUrl: "http://localhost:3000"
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
-  # Per-channel default harness / model / provider / reasoning, keyed by Slack
-  # conversation id (the C…/G…/D… id). Each value is an object of optional
-  # harness / model / provider / reasoning fields, using the same vocabulary as
+  # Per-channel default persona / harness / model / provider / reasoning, keyed
+  # by Slack conversation id (the C…/G…/D… id). Each value is an object of
+  # optional persona / harness / model / provider / reasoning fields, using the same vocabulary as
   # the inline Slack flags (harness: claude|codex|nanocodex|amp, provider: bedrock|meta,
   # model accepts Claude aliases like opus). A model is only meaningful within a
   # harness, so name the harness alongside it. Applied when a message in that
   # channel carries no explicit/sticky per-thread flag, below such a flag and
   # above the deployment/baked harness default, and forwarded onto the harness
   # input line so it takes effect. reasoning only affects the codex harness.
+  # persona names a deployed persona and applies when a thread's session is
+  # created, like --persona.
   # Example:
   #   channelDefaults:
-  #     C0ENG: { harness: claude, model: opus, reasoning: high }
+  #     C0ENG: { persona: eng, harness: claude, model: opus, reasoning: high }
   #     C0TRIAGE: { reasoning: low }
   channelDefaults: {}
   # Message overrides strategy for Slack message text. "flags" keeps the legacy
