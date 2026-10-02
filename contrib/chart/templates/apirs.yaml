@@ -375,11 +375,15 @@ spec:
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
 {{- if .Values.sandbox.stateVolume.enabled }}
+{{- if not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_ENABLED") }}
             - name: SESSION_SANDBOX_STATE_VOLUME_ENABLED
               value: "true"
+{{- end }}
+{{- if not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_SIZE") }}
             - name: SESSION_SANDBOX_STATE_VOLUME_SIZE
               value: {{ .Values.sandbox.stateVolume.size | quote }}
-{{- if .Values.sandbox.stateVolume.storageClassName }}
+{{- end }}
+{{- if and .Values.sandbox.stateVolume.storageClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME")) }}
             - name: SESSION_SANDBOX_STATE_VOLUME_STORAGE_CLASS_NAME
               value: {{ .Values.sandbox.stateVolume.storageClassName | quote }}
 {{- end }}
