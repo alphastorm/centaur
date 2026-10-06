@@ -30,14 +30,16 @@ OpenAI one only when `CODEX_AUTH_MODE` is `api_key`. api-rs refuses to start wit
 
 | Variable | Purpose |
 |---|---|
-| `CENTAUR_OMP_MODEL` | Default model as `provider/modelId`, for example `anthropic/claude-opus-4-8` or `openai/gpt-5.5`. When unset, OMP chooses or restores its model. |
+| `CENTAUR_OMP_MODEL` | Default model as `provider/modelId`, for example `anthropic/claude-opus-4-8` or `openai/gpt-5.5`. When unset, OMP chooses the model for a new thread and a resumed thread keeps its saved model. |
 | `CENTAUR_OMP_BIN` | OMP executable (default: `omp` on `PATH`). |
 | `CENTAUR_OMP_SESSION_ROOT` | Session root (default: `~/.omp/centaur-sessions`). |
 
 Set these through `sandbox.extraEnv`. Slack mirrors `CENTAUR_OMP_MODEL` for its
 model display. A per-thread `--model provider/modelId` overrides the default.
 OMP resolves the provider/model pair; there is no static model allowlist. A
-rejected model fails that turn, and later turns use the last working model.
+rejected model fails that turn, and later turns use the last working model. With
+no model set, OMP will not resume a thread on another model when its saved model
+is no longer available, so the thread's turns fail until it names one.
 
 Turns run at the `high` thinking level unless `-rsn <level>` sets one for that
 turn (`none` turns thinking off). OMP clamps the level to the model's capabilities.

@@ -12,7 +12,7 @@ use uuid::Uuid;
 const KEY: &str = "slack:C123:123.456";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/omp");
 
-/// Answers startup before replaying recordings from OMP 18.5.0 against a
+/// Answers startup before replaying recordings from OMP 18.6.3 against a
 /// loopback provider. The background gate pauses before session_settled.
 fn fake_omp(dir: &std::path::Path) -> PathBuf {
     let script = r##"#!/bin/sh
@@ -35,11 +35,18 @@ while IFS= read -r line; do
             printf '%s\n' '{"id":"centaur-negotiate_protocol","type":"response","command":"negotiate_protocol","success":true,"data":{"protocolVersion":2}}' ;;
         esac ;;
     open_session)
-        if [ "$OMP_TEST_FAULT" = cancelled ]; then cancelled=true; else cancelled=false; fi
-        printf '{"id":"centaur-open_session","type":"response","command":"open_session","success":true,"data":{"cancelled":%s}}\n' "$cancelled" ;;
-    set_model)
-        case "$line" in *'"modelId":"missing"'*) success=false ;; *) success=true ;; esac
-        printf '{"id":"centaur-set_model","type":"response","command":"set_model","success":%s,"error":"model not found"}\n' "$success" ;;
+        cancelled=false error=
+        case "$line" in
+        *'"modelId":"missing"'*) error='Model not found: custom/missing' ;;
+        *'"modelId"'*) ;;
+        *) if [ "$OMP_TEST_FAULT" = restore_model ]; then error='Could not restore model custom/saved'; fi ;;
+        esac
+        if [ "$OMP_TEST_FAULT" = cancelled ]; then cancelled=true; fi
+        if [ -n "$error" ]; then
+            printf '{"id":"centaur-open_session","type":"response","command":"open_session","success":false,"error":"%s"}\n' "$error"
+        else
+            printf '{"id":"centaur-open_session","type":"response","command":"open_session","success":true,"data":{"cancelled":%s}}\n' "$cancelled"
+        fi ;;
     prompt)
         printf '%s\n' '{"type":"response","command":"prompt","success":true}'
         case "$line" in
@@ -245,7 +252,6 @@ fn startup_renders_final_text_and_reasoning_restores_default() {
             "set_event_filter",
             "open_session",
             "set_cache_warming",
-            "set_model",
             "set_thinking_level",
             "set_thinking_level",
             "prompt",
@@ -259,8 +265,10 @@ fn startup_renders_final_text_and_reasoning_restores_default() {
             .to_string_lossy()
             .as_ref()
     );
-    assert_eq!(first[5]["level"], "high");
-    assert_eq!(first[6]["level"], "off");
+    assert_eq!(first[2]["provider"], "custom");
+    assert_eq!(first[2]["modelId"], "new-model");
+    assert_eq!(first[4]["level"], "high");
+    assert_eq!(first[5]["level"], "off");
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     assert_eq!(
         &server.commands()[first.len()..],
@@ -487,7 +495,6 @@ fn startup_failures_never_send_a_prompt_and_next_turn_retries() {
         "set_event_filter",
         "open_session",
         "set_cache_warming",
-        "set_model",
         "set_thinking_level",
         "v1",
         "eof",
@@ -497,11 +504,17 @@ fn startup_failures_never_send_a_prompt_and_next_turn_retries() {
             ("OMP_TEST_FAULT", fault),
             ("CENTAUR_OMP_MODEL", "custom/new-model"),
         ]);
-        for _ in 0..2 {
-            assert_eq!(status(&server.turn("text", json!({}))), "failed", "{fault}");
+        for extra in [json!({"model": "custom/requested"}), json!({})] {
+            assert_eq!(status(&server.turn("text", extra)), "failed", "{fault}");
         }
+        let commands = server.commands();
+        assert!(!commands.iter().any(|c| c["type"] == "prompt"), "{fault}");
+        // Only a rejected model sends the thread back to its last working model.
         assert!(
-            !server.commands().iter().any(|c| c["type"] == "prompt"),
+            commands
+                .iter()
+                .filter(|c| c["type"] == "open_session")
+                .all(|c| c["modelId"] == "requested"),
             "{fault}"
         );
         assert_eq!(
@@ -534,7 +547,13 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
         .iter()
         .filter(|c| c["type"] == "open_session")
         .collect();
-    assert_eq!(opened.len(), 3);
+    assert_eq!(
+        opened
+            .iter()
+            .map(|open| open.get("modelId"))
+            .collect::<Vec<_>>(),
+        [None, None, Some(&json!("switched"))]
+    );
     for open in opened {
         assert_eq!(
             open["sessionDir"],
@@ -560,17 +579,36 @@ fn unavailable_model_restores_the_last_working_model() {
         turn.last().unwrap()["params"]["turn"]["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("unsupported model `custom/missing` for OMP: model not found")
+            .contains(
+                "unsupported model `custom/missing` for OMP: Model not found: custom/missing"
+            )
     );
     assert_eq!(status(&server.turn("text", json!({}))), "completed");
     let commands = server.commands();
     assert_eq!(
         commands
             .iter()
-            .filter(|c| c["type"] == "set_model")
+            .filter(|c| c["type"] == "open_session")
             .map(|c| c["modelId"].as_str().unwrap())
             .collect::<Vec<_>>(),
         ["working", "missing", "working"]
+    );
+}
+
+#[test]
+fn unrestorable_saved_model_fails_until_a_turn_names_a_model() {
+    let mut server = Server::new(&[("OMP_TEST_FAULT", "restore_model")]);
+    let turn = server.turn("text", json!({}));
+    assert_eq!(status(&turn), "failed");
+    assert!(
+        turn.last().unwrap()["params"]["turn"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("omp open_session: Could not restore model custom/saved")
+    );
+    assert_eq!(
+        status(&server.turn("text", json!({"model": "custom/named"}))),
+        "completed"
     );
 }
 

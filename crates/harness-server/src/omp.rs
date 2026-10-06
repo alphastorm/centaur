@@ -86,13 +86,13 @@ impl HarnessServer for OmpHarness {
             let mut response = startup_command(process, &mut normalizer, kind, fields)?;
             if response["success"] != true {
                 let error = response["error"].as_str().unwrap_or("command failed");
-                return Err(if kind == "set_model" {
-                    HarnessServerError::UnknownModel {
+                // open_session checks a requested model as set_model does.
+                if kind == "open_session" && error.starts_with("Model not found:") {
+                    return Err(HarnessServerError::UnknownModel {
                         message: format!("unsupported model `{}` for OMP: {error}", state.model),
-                    }
-                } else {
-                    protocol_error(format!("{kind}: {error}"))
-                });
+                    });
+                }
+                return Err(protocol_error(format!("{kind}: {error}")));
             }
             Ok(response["data"].take())
         };
@@ -106,17 +106,18 @@ impl HarnessServer for OmpHarness {
             "set_event_filter",
             json!({"events": ["message_update", "message_end", "tool_execution_start", "tool_execution_end"], "messageUpdates": "delta"}),
         )?;
-        let opened = command("open_session", json!({"sessionDir": dir}))?;
+        // OMP resumes the session on its saved model, and refuses to when that
+        // model is no longer available, so the turn's model goes in the same call.
+        let mut open = json!({"sessionDir": dir});
+        if let Some((provider, model_id)) = split_model(&state.model) {
+            open["provider"] = json!(provider);
+            open["modelId"] = json!(model_id);
+        }
+        let opened = command("open_session", open)?;
         if opened["cancelled"] == true {
             return Err(protocol_error("open_session: cancelled"));
         }
         command("set_cache_warming", json!({"mode": "off"}))?;
-        if let Some((provider, model_id)) = split_model(&state.model) {
-            command(
-                "set_model",
-                json!({"provider": provider, "modelId": model_id}),
-            )?;
-        }
         command(
             "set_thinking_level",
             json!({"level": DEFAULT_THINKING_LEVEL}),
@@ -357,7 +358,7 @@ impl OmpEventNormalizer {
         out
     }
 
-    /// Mirrors OMP v18.5.0 packages/coding-agent/src/modes/rpc/rpc-frame.ts:
+    /// Mirrors OMP v18.6.3 packages/coding-agent/src/modes/rpc/rpc-frame.ts:
     /// one contiguous base64 chunk group, bounded size, exact metadata and JSON.
     fn frame(&mut self, frame: Value) -> Result<Option<Value>> {
         if frame["type"] != "rpc_chunk" {

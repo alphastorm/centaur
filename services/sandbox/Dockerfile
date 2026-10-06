@@ -206,7 +206,7 @@ ARG FOUNDRY_VERSION=v1.7.0
 ARG AMP_CLI_VERSION=0.0.1774529752-g94f44d
 ARG MANIM_VERSION=0.20.1
 ARG BUN_VERSION=bun-v1.3.14
-ARG OMP_VERSION=18.5.0
+ARG OMP_VERSION=18.6.3
 
 # ── Agent-scoped toolchains ─────────────────────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
