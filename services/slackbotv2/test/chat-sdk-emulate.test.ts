@@ -527,6 +527,49 @@ describe('slackbotv2', () => {
   // The paragraph break (`\n\n`) after the model value is deliberate: the
   // unpatched chat SDK dropped it, gluing the value to the next word
   // (`fablefirst`); this exercises the patched extractPlainText end to end.
+  for (const scenario of ['classifier', 'harness flag', 'model flag', 'channel default', 'sticky thread', 'rollout', 'cleared model']) {
+    it(`does not route to a disabled harness via ${scenario}`, async () => {
+      const state = createMemoryState()
+      await state.connect()
+      bot = createTestBot({
+        state,
+        enabledHarnesses: ['codex', 'claudecode'],
+        defaultHarnessType: scenario === 'cleared model' ? 'claudecode' : undefined,
+        channelDefaults: scenario === 'channel default' || scenario === 'cleared model'
+          ? { [CHANNEL_ID]: { harnessType: 'amp', model: 'fast' } } : undefined,
+        codexNanocodexRolloutPercent: scenario === 'rollout' ? 100 : 0,
+        messageOverridesStrategy: scenario === 'classifier'
+          ? async () => ({ overrides: { harnessType: 'amp', model: 'fast' } }) : undefined
+      })
+      const parent = await postUserMessage('Harness policy thread context.')
+      if (scenario === 'sticky thread') {
+        await state.set(`thread-state:${threadKey(parent.ts)}`, {
+          harnessType: 'amp', model: 'fast', provider: 'responses'
+        })
+      }
+      const text = scenario === 'harness flag' ? '--amp --model fast review this'
+        : scenario === 'model flag' ? '--model fast review this'
+        : scenario === 'cleared model' ? '--codex review this'
+        : 'get average scanner fast runtime and scanner superfast runtime'
+      const mention = await sendMessage(`<@${BOT_USER_ID}> ${text}`, { threadTs: parent.ts })
+      expect(mention.response.status).toBe(200)
+      await mention.finished()
+      expect(codexApi.creates.map(create => create.body.harness_type)).toEqual(['codex'])
+      expect(codexApi.executes).toHaveLength(1)
+      const execute = codexApi.executes[0]!.body
+      expect(JSON.parse(execute.input_lines.at(-1)!).model).toBeUndefined()
+      expect(JSON.parse(execute.input_lines.at(-1)!).provider).toBeUndefined()
+      expect(execute.metadata.harness_type).toBe('codex')
+      if (scenario !== 'rollout') {
+        expect(await state.get(`thread-state:${threadKey(parent.ts)}`)).toEqual(
+          expect.objectContaining({ harnessType: 'codex' })
+        )
+      }
+      const replies = await slack.conversations.replies({ channel: CHANNEL_ID, ts: parent.ts })
+      expect(JSON.stringify(replies.messages?.filter(message => message.user === BOT_USER_ID)))
+        .not.toContain('Amp')
+    })
+  }
   it('pins sticky persona state without labeling a pinned mismatch as unavailable', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()
@@ -2586,6 +2629,79 @@ describe('slackbotv2', () => {
       )
     ).toHaveLength(1)
   })
+
+  for (const plainText of [false, true]) {
+    it(`removes unresolved citations from ${plainText ? 'plain-text terminal replies' : 'streamed answers'}`, async () => {
+      codexApi.autoRespond = false
+
+      const parent = await postUserMessage('Context before an answer with citations.')
+      const prompt = plainText ? 'reply in plain text only' : 'answer with sources'
+      const mention = await postUserMessage(`<@${BOT_USER_ID}> ${prompt}`, parent.ts)
+      const key = threadKey(parent.ts)
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request(
+        '/api/webhooks/slack',
+        signedSlackEvent({
+          event_id: `Ev-slackbotv2-citations-${plainText}`,
+          event: {
+            type: 'app_mention',
+            user: USER_ID,
+            channel: CHANNEL_ID,
+            team: TEAM_ID,
+            ts: mention.ts,
+            thread_ts: parent.ts,
+            text: `<@${BOT_USER_ID}> ${prompt}`
+          }
+        }),
+        {},
+        waitUntilContext(waits)
+      )
+
+      expect(response.status).toBe(200)
+      await waitFor(() => codexApi.executes.length === 1)
+      await waitFor(() => codexApi.eventRequests.length === 1)
+      await waitFor(() => codexApi.streamCount === 1)
+
+      const deltas = [
+        'CITATION_START \uE200ci',
+        'te\uE202turn0search8',
+        '\uE201 [Docs](https://example.com) ',
+        '\uE200cite:ship:turn0search7:walk',
+        'ing: CITATION_END :ship:'
+      ]
+      codexApi.emitOutputLine(key, JSON.stringify({
+        type: 'item.started',
+        item: { id: 'answer-citations', type: 'agentMessage', text: '', phase: 'final_answer' }
+      }))
+      for (const delta of deltas) {
+        codexApi.emitOutputLine(key, JSON.stringify({
+          type: 'item.agentMessage.delta',
+          itemId: 'answer-citations',
+          delta
+        }))
+      }
+      codexApi.emitSessionEvent(key, 'session.execution_completed', {
+        execution_id: 'exe-citations',
+        status: 'completed',
+        result_text: deltas.join('')
+      })
+
+      await Promise.all(waits)
+      if (plainText) {
+        const replies = await threadTexts(parent.ts)
+        expect(replies.filter(text => text.startsWith('CITATION_START'))).toEqual([
+          'CITATION_START  [Docs](https://example.com)  CITATION_END :ship:'
+        ])
+      } else {
+        const transcripts = slackStreamTranscripts(slackApi.calls)
+        expect(transcripts).toHaveLength(1)
+        expect(transcripts[0]!.chunks.filter(chunk => chunk.type === 'markdown_text')
+          .map(chunk => chunk.text).join('')).toBe(
+          'CITATION_START  [Docs](https://example.com)  CITATION_END :ship:'
+        )
+      }
+    })
+  }
 
   it('keeps each task on one bounded card as details grow and output expands', async () => {
     codexApi.autoRespond = false

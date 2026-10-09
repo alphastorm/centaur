@@ -13,13 +13,15 @@ use std::time::Duration;
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
+use self::citations::CodexCitationFilter;
 use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::server::{
     BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
     write_blocks_error,
 };
-use crate::util::write_value;
 use crate::{AppServerRuntime, HarnessServerError, Result};
+
+mod citations;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CodexHarnessServer {
@@ -102,13 +104,20 @@ impl AppServerRuntime for CodexHarnessServer {
             io::copy(&mut child_stderr, &mut stderr)
         });
 
-        let mut child_stdout = child
+        let child_stdout = child
             .stdout
             .take()
             .ok_or(HarnessServerError::CodexStdoutUnavailable)?;
         {
             let mut stdout = io::stdout().lock();
-            io::copy(&mut child_stdout, &mut stdout)?;
+            let mut citations = CodexCitationFilter::default();
+            for line in io::BufReader::new(child_stdout).lines() {
+                let line = line?;
+                if !line.trim().is_empty() {
+                    citations.write_value(&mut stdout, &serde_json::from_str(&line)?)?;
+                }
+            }
+            citations.finish(&mut stdout)?;
             stdout.flush()?;
         }
 
@@ -353,8 +362,14 @@ fn run_codex_user_turn<W: Write>(
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
-        let thread =
-            start_or_resume_thread(codex, stdout, request_id, &model_provider, traceparent)?;
+        let thread = start_or_resume_thread(
+            codex,
+            stdout,
+            request_id,
+            model.as_deref(),
+            &model_provider,
+            traceparent,
+        )?;
         *thread_id = Some(thread.id);
         *thread_model = thread.model;
         *thread_provider = Some(model_provider.clone());
@@ -440,7 +455,7 @@ fn run_codex_user_turn<W: Write>(
                     // This is also the `CODEX_ENGINE_RETRY_MAX=0` fail-fast path.
                     for value in &withheld {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        codex.citations.write_value(stdout, value)?;
                     }
                     return Ok(());
                 }
@@ -464,6 +479,7 @@ fn start_or_resume_thread<W: Write>(
     codex: &mut CodexJsonRpcChild,
     stdout: &mut W,
     request_id: &mut i64,
+    model: Option<&str>,
     model_provider: &str,
     traceparent: Option<&str>,
 ) -> Result<StartedCodexThread> {
@@ -471,7 +487,7 @@ fn start_or_resume_thread<W: Write>(
     let resume = env::var("CODEX_CONTINUE_THREAD_ID")
         .or_else(|_| env::var("AMP_CONTINUE_THREAD_ID"))
         .unwrap_or_default();
-    let (method, params) = if resume.trim().is_empty() {
+    let (method, mut params) = if resume.trim().is_empty() {
         (
             "thread/start",
             json!({
@@ -496,6 +512,13 @@ fn start_or_resume_thread<W: Write>(
             }),
         )
     };
+    // Start the thread on the model its first turn runs. Without this, the
+    // thread starts on config.toml's `model` and switches on its first turn,
+    // and the Responses backend intermittently refuses that first request
+    // with "model '…' is not enabled in …" (400).
+    if let Some(model) = model {
+        params["model"] = Value::String(model.to_owned());
+    }
 
     let id = next_request_id(request_id);
     codex.send_request(id, method, params, traceparent)?;
@@ -524,6 +547,7 @@ struct CodexJsonRpcChild {
     child: Child,
     stdin: ChildStdin,
     stdout: Receiver<io::Result<String>>,
+    citations: CodexCitationFilter,
 }
 
 impl CodexJsonRpcChild {
@@ -575,6 +599,7 @@ impl CodexJsonRpcChild {
             child,
             stdin,
             stdout: stdout_rx,
+            citations: CodexCitationFilter::default(),
         })
     }
 
@@ -635,7 +660,7 @@ impl CodexJsonRpcChild {
                 return Ok(value.get("result").cloned().unwrap_or(Value::Null));
             }
             if notification_method(&value).is_some() && !is_dropped_notification(&value) {
-                write_value(stdout, &value)?;
+                self.citations.write_value(stdout, &value)?;
             }
         }
     }
@@ -708,13 +733,13 @@ impl CodexJsonRpcChild {
                 GuardStep::Forward(values) => {
                     for value in &values {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        self.citations.write_value(stdout, value)?;
                     }
                 }
                 GuardStep::ForwardThenDone(values) => {
                     for value in &values {
                         telemetry.observe_wire_value(value);
-                        write_value(stdout, value)?;
+                        self.citations.write_value(stdout, value)?;
                     }
                     return Ok(TurnTermination::Done);
                 }

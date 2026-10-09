@@ -70,11 +70,12 @@
 {{- $apiRsMetricsAnnotations = mergeOverwrite $apiRsMetricsAnnotations (.Values.apiRs.metrics.annotations | default dict) -}}
 {{- end -}}
 {{- $apiRsEtl := .Values.apiRs.etl | default dict -}}
+{{- $companyContextV1Enabled := .Values.companyContextV1.enabled -}}
 {{- $companyContextEmbeddingsEnabled := dig "companyContextEmbeddings" "enabled" false $apiRsEtl -}}
 {{- $companyContextEmbeddingsModel := dig "companyContextEmbeddings" "model" "text-embedding-3-small" $apiRsEtl -}}
 {{- $companyContextEmbeddingsDimensions := dig "companyContextEmbeddings" "dimensions" 1536 $apiRsEtl -}}
 {{- $apiRsEtlEnv := list
-  (dict "name" "SLACK_ETL_ENABLED" "value" (dig "slack" "enabled" false $apiRsEtl))
+  (dict "name" "SLACK_ETL_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "enabled" false $apiRsEtl)))
   (dict "name" "SLACK_SYNC_INTERVAL_SECONDS" "value" (dig "slack" "syncIntervalSeconds" 3600 $apiRsEtl))
   (dict "name" "SLACK_SYNC_BACKFILL_LOOKBACK_DAYS" "value" (dig "slack" "syncBackfillLookbackDays" 30 $apiRsEtl))
   (dict "name" "SLACK_SYNC_THREAD_LOOKBACK_DAYS" "value" (dig "slack" "syncThreadLookbackDays" 3 $apiRsEtl))
@@ -86,7 +87,7 @@
   (dict "name" "SLACK_BACKFILL_INTERVAL_SECONDS" "value" (dig "slack" "backfill" "intervalSeconds" 600 $apiRsEtl))
   (dict "name" "SLACK_BACKFILL_CHANNEL_BATCH_LIMIT" "value" (dig "slack" "backfill" "channelBatchLimit" 50 $apiRsEtl))
   (dict "name" "SLACK_BACKFILL_CHANNEL_PAGES_PER_JOB" "value" (dig "slack" "backfill" "channelPagesPerJob" 5 $apiRsEtl))
-  (dict "name" "SLACK_RETENTION_ENABLED" "value" (dig "slack" "retention" "enabled" true $apiRsEtl))
+  (dict "name" "SLACK_RETENTION_ENABLED" "value" (and $companyContextV1Enabled (dig "slack" "retention" "enabled" true $apiRsEtl)))
   (dict "name" "SLACK_RETENTION_INTERVAL_MINUTES" "value" (dig "slack" "retention" "intervalMinutes" 60 $apiRsEtl))
   (dict "name" "SLACK_ETL_RETENTION_DAYS" "value" (dig "slack" "retention" "etlDays" 0 $apiRsEtl))
   (dict "name" "SLACK_DM_RETENTION_DAYS" "value" (dig "slack" "retention" "dmDays" 0 $apiRsEtl))
@@ -464,6 +465,15 @@ spec:
             # plane's pods (callback + postgres-listener access).
             - name: KUBERNETES_API_POD_LABEL_SELECTOR
               value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=api-rs" (include "centaur.name" .) .Release.Name | quote }}
+            - name: KUBERNETES_IRON_PROXY_SYNC_POD_LABEL_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=proxy-sync" (include "centaur.name" .) .Release.Name | quote }}
+{{- if .Values.experimentalCompanyContext.enabled }}
+            # Sandboxes call the company-context query API through their proxy.
+            - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_URL
+              value: {{ printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port | quote }}
+            - name: KUBERNETES_IRON_PROXY_COMPANY_CONTEXT_POD_LABEL_SELECTOR
+              value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=company-context" (include "centaur.name" .) .Release.Name | quote }}
+{{- end }}
             - name: FIREWALL_MANAGER_SECRET_SOURCE
               value: {{ .Values.ironProxy.secretSource | quote }}
             - name: FIREWALL_MANAGER_SECRET_TTL
@@ -510,6 +520,10 @@ spec:
 {{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_DIMENSIONS" "value" ($companyContextEmbeddingsDimensions | toString)) }}
+{{- end }}
+{{- if and .Values.experimentalCompanyContext.enabled (not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_API_URL")) }}
+{{- /* The company_context tool's v2 commands call this query API through the proxy. */}}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_API_URL" "value" (printf "http://%s:%v" (include "centaur.componentName" (dict "root" . "component" "company-context")) .Values.experimentalCompanyContext.port)) }}
 {{- end }}
 {{- if .Values.codex.customProviders }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CODEX_CUSTOM_PROVIDERS" "value" (.Values.codex.customProviders | toJson)) }}

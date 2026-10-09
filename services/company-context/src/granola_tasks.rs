@@ -10,8 +10,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     config::{
-        GRANOLA_CREDENTIALS_RECONCILE_TASK, GRANOLA_NOTE_EMBED_TASK, GRANOLA_NOTES_FETCH_TASK,
-        GRANOLA_SYNC_TASK,
+        GRANOLA_CREDENTIALS_RECONCILE_TASK, GRANOLA_DOCUMENT_ID_PREFIX, GRANOLA_NOTE_EMBED_TASK,
+        GRANOLA_NOTES_FETCH_TASK, GRANOLA_SYNC_TASK,
     },
     credentials::GranolaCredential,
     errors::{is_rejected, rejected},
@@ -545,7 +545,10 @@ async fn embed_note(
     let chunks = chunk_text(&content_text, state.config.chunk_chars)
         .into_iter()
         .map(|chunk| {
-            let document_id = format!("granola:{}:{}", params.note_id, chunk.chunk_id);
+            let document_id = format!(
+                "{GRANOLA_DOCUMENT_ID_PREFIX}{}:{}",
+                params.note_id, chunk.chunk_id
+            );
             let content_hash = hex_sha256(format!("{title}\n\n{}", chunk.body).as_bytes());
             (document_id, chunk.chunk_id, chunk.body, content_hash)
         })
@@ -761,15 +764,12 @@ async fn record_embedding_failure(
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::env;
 
-    use sqlx::{Connection, Executor, PgConnection};
+    use sqlx::Executor;
 
     use super::*;
-    use crate::{database, granola::Participant};
+    use crate::{granola::Participant, test_support::TestDatabase};
 
     fn credential(id: i64) -> GranolaCredential {
         GranolaCredential {
@@ -810,21 +810,8 @@ mod tests {
             eprintln!("skipping: set COMPANY_CONTEXT_TEST_DATABASE_URL to a ParadeDB Postgres URL");
             return;
         };
-        let mut admin = PgConnection::connect(&database_url).await.unwrap();
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let name = format!("company_context_granola_{}_{nanos}", std::process::id());
-        admin
-            .execute(format!(r#"create database "{name}""#).as_str())
-            .await
-            .unwrap();
-        let mut test_url = url::Url::parse(&database_url).unwrap();
-        test_url.set_path(&name);
-        let pool = database::connect_and_migrate(test_url.as_str())
-            .await
-            .unwrap();
+        let database = TestDatabase::create(&database_url, "granola").await;
+        let pool = database.pool.clone();
 
         // Unchanged pending notes are returned again so a lost embed spawn recovers.
         let staged = stage_note(
@@ -894,10 +881,6 @@ mod tests {
         .unwrap();
         assert_eq!(restored, Some(4));
 
-        pool.close().await;
-        admin
-            .execute(format!(r#"drop database if exists "{name}""#).as_str())
-            .await
-            .unwrap();
+        database.drop().await;
     }
 }

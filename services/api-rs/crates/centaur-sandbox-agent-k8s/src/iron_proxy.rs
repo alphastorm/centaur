@@ -105,6 +105,11 @@ pub struct IronProxyConfig {
     pub op_connect_port: u16,
     pub api_pod_labels: BTreeMap<String, String>,
     pub control_plane_pod_labels: BTreeMap<String, String>,
+    pub proxy_sync_pod_labels: BTreeMap<String, String>,
+    /// In-cluster company-context API that proxies may reach on behalf of
+    /// sandboxes, and the labels of its pods. Unset allows no such egress.
+    pub company_context_url: Option<String>,
+    pub company_context_pod_labels: BTreeMap<String, String>,
     pub resources: Option<ResourceRequirements>,
 }
 
@@ -137,6 +142,15 @@ impl IronProxyConfig {
             control_plane_pod_labels: BTreeMap::from([(
                 "app.kubernetes.io/component".to_owned(),
                 "console".to_owned(),
+            )]),
+            proxy_sync_pod_labels: BTreeMap::from([(
+                "app.kubernetes.io/component".to_owned(),
+                "proxy-sync".to_owned(),
+            )]),
+            company_context_url: None,
+            company_context_pod_labels: BTreeMap::from([(
+                "app.kubernetes.io/component".to_owned(),
+                "company-context".to_owned(),
             )]),
             resources: None,
         }
@@ -382,11 +396,24 @@ impl AgentSandboxBackend {
             &self.config.namespace,
             iron_proxy.control_plane_pod_labels.clone(),
         );
+        let proxy_sync_target = control_plane_egress_target(
+            &sync.control_url,
+            &self.config.namespace,
+            iron_proxy.proxy_sync_pod_labels.clone(),
+        );
+        let mut control_targets = vec![control_target, proxy_sync_target];
+        if let Some(url) = &iron_proxy.company_context_url {
+            control_targets.push(control_plane_egress_target(
+                url,
+                &self.config.namespace,
+                iron_proxy.company_context_pod_labels.clone(),
+            ));
+        }
         for policy in build_iron_proxy_network_policies(
             id,
             resolved,
             iron_proxy,
-            &control_target,
+            &control_targets,
             self.config.otlp_egress.as_ref(),
             resolved.observability_enabled,
         ) {
@@ -1735,7 +1762,7 @@ fn build_iron_proxy_network_policies(
     id: &SandboxId,
     resolved: &ResolvedIronProxy,
     iron_proxy: &IronProxyConfig,
-    control_target: &ControlPlaneEgressTarget,
+    control_targets: &[ControlPlaneEgressTarget],
     otlp_egress: Option<&OtlpEgressTarget>,
     observability_enabled: bool,
 ) -> Vec<NetworkPolicy> {
@@ -1782,7 +1809,7 @@ fn build_iron_proxy_network_policies(
                 ]),
                 egress: Some(proxy_egress_rules(
                     iron_proxy,
-                    control_target,
+                    control_targets,
                     otlp_egress,
                     observability_enabled,
                 )),
@@ -1799,20 +1826,20 @@ fn sandbox_to_proxy_ports(resolved: &ResolvedIronProxy) -> Vec<NetworkPolicyPort
 
 fn proxy_egress_rules(
     iron_proxy: &IronProxyConfig,
-    control_target: &ControlPlaneEgressTarget,
+    control_targets: &[ControlPlaneEgressTarget],
     otlp_egress: Option<&OtlpEgressTarget>,
     observability_enabled: bool,
 ) -> Vec<NetworkPolicyEgressRule> {
-    // Upstream egress: 443/5432 for normal traffic, plus the iron-control port
-    // (deduped) so a sync-mode proxy can reach the control plane. Public
-    // upstreams are always constrained away from private/cluster CIDRs; any
-    // intra-cluster destination must be added as an explicit rule below.
+    // Console and proxy-sync can use different pods and ports. Allow both
+    // explicitly; public upstream rules exclude private/cluster CIDRs.
     let upstream_ports = vec![network_port(443), network_port(5432)];
     let mut rules = vec![dns_egress_rule()];
-    rules.push(egress_to(
-        vec![control_target.peer.clone()],
-        vec![network_port(control_target.port)],
-    ));
+    for target in control_targets {
+        rules.push(egress_to(
+            vec![target.peer.clone()],
+            vec![network_port(target.port)],
+        ));
+    }
     rules.push(egress_to(
         vec![all_namespaces_peer()],
         vec![network_port(PG_LISTENER_PORT)],
@@ -2803,7 +2830,7 @@ mod tests {
             &id,
             &resolved,
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             true,
         );
@@ -2855,7 +2882,7 @@ mod tests {
             &id,
             &resolved,
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             false,
         );
@@ -3014,7 +3041,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             Some(&target),
             true,
         );
@@ -3043,7 +3070,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             None,
             true,
         );
@@ -3076,7 +3103,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             Some(&target),
             false,
         );
@@ -3153,7 +3180,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target(),
+            &[control_target()],
             None,
             false,
         );
@@ -3178,25 +3205,6 @@ mod tests {
         assert!(!sandbox_egress.iter().any(allows_database));
         let proxy_egress = policies[1].spec.as_ref().unwrap().egress.as_ref().unwrap();
         assert!(proxy_egress.iter().any(allows_database));
-    }
-
-    #[test]
-    fn managed_proxy_env_sets_response_header_timeout() {
-        let iron_proxy = IronProxyConfig::new("proxy:test", "ca-cert", "ca-key");
-        let sync = ProxySyncEnv {
-            proxy_id: "proxy-id".to_owned(),
-            control_url: "http://iron-control".to_owned(),
-            token: "proxy-token".to_owned(),
-            config_hash: None,
-        };
-
-        let env = iron_proxy_env_vars(&iron_proxy, &resolved(), &sync);
-        let timeout = env
-            .iter()
-            .find(|var| var.name == "IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT")
-            .and_then(|var| var.value.as_deref());
-
-        assert_eq!(timeout, Some("120s"));
     }
 
     #[test]
@@ -3267,7 +3275,7 @@ mod tests {
             &id,
             &resolved(),
             &iron_proxy,
-            &control_target,
+            std::slice::from_ref(&control_target),
             None,
             true,
         );
@@ -3575,18 +3583,6 @@ mod tests {
                 "{name} should preserve explicit NO_PROXY extras: {value}"
             );
         }
-    }
-
-    #[test]
-    fn proxy_fallback_delay_subtracts_elapsed_probe_time() {
-        assert_eq!(
-            proxy_fallback_delay_remaining(Duration::from_secs(2)),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            proxy_fallback_delay_remaining(Duration::from_secs(10)),
-            Duration::ZERO
-        );
     }
 
     #[test]

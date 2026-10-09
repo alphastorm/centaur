@@ -16,8 +16,9 @@ use tracing::{error, info, warn};
 use crate::{
     config::{
         Config, DOCUMENT_DELETE_TASK, DOCUMENT_EMBED_TASK, DOCUMENT_EXTRACT_TASK,
-        DRIVE_CREDENTIALS_RECONCILE_TASK, DRIVE_SCAN_TASK, GOOGLE_DOC_MIME_TYPE, PDF_MIME_TYPE,
-        SHARED_DRIVE_SCAN_TASK, SHARED_DRIVES_DISCOVER_TASK, SHARED_FOLDERS_BATCH_TASK,
+        DRIVE_CREDENTIALS_RECONCILE_TASK, DRIVE_SCAN_TASK, GOOGLE_DOC_MIME_TYPE,
+        GOOGLE_DRIVE_DOCUMENT_ID_PREFIX, PDF_MIME_TYPE, SHARED_DRIVE_SCAN_TASK,
+        SHARED_DRIVES_DISCOVER_TASK, SHARED_FOLDERS_BATCH_TASK,
     },
     credentials::{ConsoleCredentials, GoogleCredential},
     drive::{DriveChange, DriveClient, DriveFile},
@@ -26,6 +27,8 @@ use crate::{
     extraction::{chunk_text, extract_google_doc_text, extract_pdf_text, hex_sha256},
     granola::GranolaClient,
     granola_tasks,
+    slack::SlackClient,
+    slack_documents, slack_files,
 };
 
 #[derive(Clone)]
@@ -36,6 +39,7 @@ pub struct TaskState {
     pub credentials: Arc<ConsoleCredentials>,
     pub drive: DriveClient,
     pub granola: GranolaClient,
+    pub slack: SlackClient,
     pub embeddings: EmbeddingsClient,
 }
 
@@ -113,6 +117,8 @@ pub struct TaskSummary {
 
 pub fn register(state: TaskState) -> Result<()> {
     granola_tasks::register(&state)?;
+    slack_documents::register(&state)?;
+    slack_files::register(&state)?;
 
     let reconcile_state = state.clone();
     state.absurd.register_task(
@@ -1267,7 +1273,7 @@ async fn embed_document(
         let chunk_id: String = chunk.try_get("chunk_id")?;
         let body: String = chunk.try_get("body")?;
         let content_hash = hex_sha256(format!("{}\n\n{}", file.name, body).as_bytes());
-        let document_id = format!("google-drive:{}:{chunk_id}", file.id);
+        let document_id = format!("{GOOGLE_DRIVE_DOCUMENT_ID_PREFIX}{}:{chunk_id}", file.id);
         chunks.push((document_id, chunk_id, body, content_hash));
     }
     // Drive versions change for metadata-only edits; reuse vectors for unchanged chunk text.
@@ -1723,7 +1729,18 @@ pub(crate) async fn run_task<T>(
             _ = heartbeat.tick() => ctx.heartbeat(None).await?,
         }
     };
-    result.map_err(|error| AbsurdError::TaskFailed(error.into_boxed_dyn_error()))
+    result.map_err(task_error)
+}
+
+/// Keeps Absurd's control flow, such as suspending for a durable sleep, intact
+/// through `anyhow` so a sleeping task is not recorded as failed.
+fn task_error(error: anyhow::Error) -> AbsurdError {
+    match error.downcast_ref::<AbsurdError>() {
+        Some(AbsurdError::Suspend) => AbsurdError::Suspend,
+        Some(AbsurdError::Cancelled) => AbsurdError::Cancelled,
+        Some(AbsurdError::FailedRun) => AbsurdError::FailedRun,
+        _ => AbsurdError::TaskFailed(error.into_boxed_dyn_error()),
+    }
 }
 
 #[cfg(test)]
@@ -1836,6 +1853,18 @@ mod tests {
             checkpoint_scope(7, Some("drive-a")),
             "shared_drive:drive-a:broker:7"
         );
+    }
+
+    #[test]
+    fn suspension_is_not_a_task_failure() {
+        let suspended = Err::<(), _>(AbsurdError::Suspend)
+            .context("wait for Slack rate limit")
+            .unwrap_err();
+        assert!(matches!(task_error(suspended), AbsurdError::Suspend));
+        assert!(matches!(
+            task_error(anyhow!("boom")),
+            AbsurdError::TaskFailed(_)
+        ));
     }
 
     #[test]
