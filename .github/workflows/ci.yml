@@ -150,6 +150,10 @@ jobs:
             '^tools/' \
             '^centaur_sdk/' \
             '^\.github/scripts/run-tool-tests\.sh$' \
+            '^\.github/scripts/start-test-postgres\.sh$' \
+            '^services/api-rs/crates/centaur-session-sqlx/(search-)?migrations/' \
+            '^services/company-context/migrations/' \
+            '^services/iron-proxy/Dockerfile$' \
             '^\.github/workflows/ci\.yml$'
           set_output slackbotv2_tests \
             '^services/slackbotv2/' \
@@ -179,7 +183,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -193,7 +197,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -201,7 +205,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -225,7 +229,7 @@ jobs:
 
   company-context-checks:
     name: Company context fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.company_context_checks == 'true'
     defaults:
@@ -236,7 +240,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -265,7 +269,7 @@ jobs:
 
   proxy-sync-checks:
     name: Proxy sync fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.proxy_sync_checks == 'true'
     defaults:
@@ -276,7 +280,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -337,7 +341,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -348,7 +352,7 @@ jobs:
       - name: Start Test Postgres
         run: .github/scripts/start-test-postgres.sh centaur-api-test-postgres 5432 centaur
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
@@ -404,7 +408,7 @@ jobs:
 
   rust-api-postgres:
     name: Rust API migrations on PostgreSQL
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -415,7 +419,7 @@ jobs:
       - name: Start Test Postgres
         run: .github/scripts/start-test-postgres.sh centaur-api-plain-postgres 5432 postgres pgvector
 
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
 
@@ -511,12 +515,17 @@ jobs:
           prune-cache: true
           cache-dependency-glob: tools/**/pyproject.toml
 
+      - name: Start Test Postgres
+        run: .github/scripts/start-test-postgres.sh tool-test-postgres 5432 postgres
+
       - name: Run tool tests
+        env:
+          COMPANY_CONTEXT_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: .github/scripts/run-tool-tests.sh
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -574,7 +583,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -608,7 +617,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -642,7 +651,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:

@@ -343,7 +343,7 @@ sandbox:
   harnessEngine: codex
   # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here are also
   # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT and
-  # CENTAUR_PI_MODEL are mirrored into slackbotv2. This keeps Slack's
+  # CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL are mirrored into slackbotv2. This keeps Slack's
   # model/thinking footer aligned with the policy the sandbox actually runs.
   extraEnv: {}
   telemetry:
@@ -451,6 +451,14 @@ proxySync:
     annotations: {}
   resources: {}
 
+# v1 company-context ingestion: the api-rs Slack workflows (slack_sync,
+# slack_backfill, slack_retention) and the Console Slack DM, Google Docs, and
+# Granola sync jobs. Set false to stop all of them, for example to roll out
+# experimentalCompanyContext in isolation. Already-synced data is kept, and
+# Slack retention does not run while this is false.
+companyContextV1:
+  enabled: true
+
 # Standalone company-context ingestion service. It indexes Google Docs and PDFs
 # from Google Drive and Granola meeting notes into its private system and data
 # schemas. Disabled while the corpus is validated alongside the legacy Python
@@ -466,6 +474,16 @@ experimentalCompanyContext:
     tag: latest
     pullPolicy: Always
   port: 8080
+  # Indexers to schedule. Disabling one pauses its ingestion; documents it
+  # already indexed stay searchable, and enabling it again resumes from its
+  # checkpoints.
+  indexers:
+    drive:
+      enabled: true
+    granola:
+      enabled: true
+    slack:
+      enabled: true
   # Rails Console OAuth app whose live per-user Google broker credentials are
   # synchronized. The embeddings API key comes from OPENAI_API_KEY in the
   # shared Kubernetes Secret.
@@ -475,6 +493,33 @@ experimentalCompanyContext:
   granolaOauthAppSlug: granola
   scanIntervalSeconds: 300
   granolaSyncIntervalSeconds: 1800
+  # Slack conversations are discovered through the same per-user Slack
+  # credentials as the Console DM sync (console.slackDmSync.oauthAppSlug).
+  # Workspace users are listed with SLACK_BOT_TOKEN from the shared Secret, so
+  # Slack documents show names instead of user IDs.
+  slackDiscoveryIntervalSeconds: 1800
+  # Fraction of each Slack method's documented rate limit ingestion may use.
+  # The rest is left for other services calling Slack as the same app.
+  slackRateLimitShare: 0.3
+  slackWorkerConcurrency: 4
+  # Thread syncs run in order on their own queue; per replica.
+  slackThreadWorkerConcurrency: 1
+  # Days of Slack message history to sync, at most 36500. Raising a value
+  # backfills the older history on the next sync; lowering one keeps messages
+  # already synced.
+  slackHistoryDays: 90
+  # Per-conversation overrides, e.g. {C0123456789: 3650}.
+  slackChannelHistoryDays: {}
+  # Rollout limits. An empty list syncs every user or conversation. Narrowing a
+  # list removes indexed data that only the excluded users or conversations kept.
+  syncLimits:
+    googleDriveUserEmails: []
+    granolaUserEmails: []
+    slackUserIds: []
+    # Slack conversation IDs (channels and DMs).
+    slackChannelIds: []
+    # Any of public_channel, private_channel, im.
+    slackConversationTypes: [public_channel, private_channel]
   drivePageSize: 100
   maxScanPages: 10
   maxPdfBytes: 26214400

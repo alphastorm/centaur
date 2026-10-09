@@ -161,11 +161,12 @@ export type SlackbotV2Options = {
    * nanocodex | hermes). Defaults to codex.
    */
   defaultHarnessType?: string
+  enabledHarnesses?: readonly string[]
   fetch?: SlackbotV2Fetch
   /**
    * Deployment-configured default model per harness wire value (claudecode |
-   * codex | nanocodex | pi), from the CLAUDE_MODEL / CODEX_MODEL /
-   * CENTAUR_PI_MODEL env vars the chart mirrors
+   * codex | nanocodex | pi | omp), from the CLAUDE_MODEL / CODEX_MODEL /
+   * CENTAUR_PI_MODEL / CENTAUR_OMP_MODEL env vars the chart mirrors
    * out of sandbox.extraEnv. Display/metadata only — never forwarded to the
    * harness. Unset harnesses fall back to the models pinned in this repo's
    * harness config files (see response-context.ts).

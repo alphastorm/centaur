@@ -2,14 +2,14 @@ import { escapeRegExp } from './utils'
 
 /**
  * Inline message directives, restored from the v1 slackbot:
- *   --claude | --claude-code | --amp | --codex | --nanocodex | --pi
+ *   --claude | --claude-code | --amp | --codex | --nanocodex | --pi | --omp
  *                                                  pick the harness for the thread
  *   --bedrock                                    codex via the AWS Bedrock provider
  *   --meta                                       codex via Meta AI direct
  *   --provider <name>                            codex via a configured provider
  *   --persona <id> (or --persona=<id>)           pick the persona independently
  *   --model <name> (or --model=<name>)           pick the model within that harness
- *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex/claude-code/pi)
+ *   -rsn <effort> (or -rsn=<effort>)             per-turn reasoning effort (codex/nanocodex/claude-code/pi/omp)
  *   --fable | --opus | --sonnet | --haiku        model shortcuts (imply claude-code)
  *
  * Flags are stripped from the text before it reaches the agent. The harness
@@ -58,7 +58,8 @@ const HARNESS_FLAGS: Record<string, string> = {
   codex: 'codex',
   hermes: 'hermes',
   nanocodex: 'nanocodex',
-  pi: 'pi'
+  pi: 'pi',
+  omp: 'omp'
 }
 
 // Provider flags select a model provider within the codex harness (and imply
@@ -88,7 +89,7 @@ const MODEL_SHORTCUTS: Record<string, { harnessType: string; model: string }> =
     ])
   )
 
-const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi'])
+const STRATEGY_HARNESSES = new Set(['amp', 'claudecode', 'codex', 'hermes', 'nanocodex', 'pi', 'omp'])
 const STRATEGY_PROVIDERS = new Set(['amazon-bedrock', 'openrouter', 'responses'])
 const STRATEGY_REASONING_EFFORTS = new Set([
   'none',
@@ -124,6 +125,7 @@ const STRATEGY_MODEL_HARNESSES: Record<string, string> = {
   'gpt-5.6-terra': 'codex',
   'gpt-6-astra': 'codex',
   'gpt-6-sol': 'codex',
+  'gpt-6.1-sol': 'codex',
   'gpt-6-luna': 'codex'
 }
 
@@ -283,7 +285,8 @@ export function validateStrategyOverrides(
       harnessType === undefined ||
       harnessType === 'codex' ||
       harnessType === 'nanocodex' ||
-      harnessType === 'pi'
+      harnessType === 'pi' ||
+      harnessType === 'omp'
         ? normalized
         : undefined
   }
@@ -387,4 +390,17 @@ function stripMatch(text: string, match: RegExpExecArray): string {
   const separator =
     before && after && !/\s$/.test(before) && !/^\s/.test(after) ? ' ' : ''
   return `${before}${separator}${after}`
+}
+
+export function parseEnabledHarnesses(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined
+  const harnesses = value.split(',').map(harness => harness.trim().toLowerCase())
+  if (harnesses.some(harness => !STRATEGY_HARNESSES.has(harness))) {
+    throw new Error('SLACKBOTV2_ENABLED_HARNESSES must contain known comma-separated harness types')
+  }
+  return [...new Set(harnesses)]
+}
+
+export function isHarnessEnabled(harness: string, enabledHarnesses?: readonly string[]): boolean {
+  return enabledHarnesses === undefined || enabledHarnesses.includes(harness)
 }

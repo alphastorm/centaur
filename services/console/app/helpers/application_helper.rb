@@ -51,6 +51,7 @@ module ApplicationHelper
     when "amp" then "Amp"
     when "nanocodex" then "Nanocodex"
     when "pi" then "Pi"
+    when "omp" then "OMP"
     when "" then nil
     else harness_type.to_s.tr("_-", " ").squish.split.map(&:capitalize).join(" ")
     end
@@ -113,11 +114,6 @@ module ApplicationHelper
 
   def console_icon(name, classes: "size-4")
     case name
-    when "database"
-      outline_icon(
-        classes,
-        "M4.5 6.75c0 1.243 3.358 2.25 7.5 2.25s7.5-1.007 7.5-2.25S16.142 4.5 12 4.5 4.5 5.507 4.5 6.75Zm0 0v10.5c0 1.243 3.358 2.25 7.5 2.25s7.5-1.007 7.5-2.25V6.75M4.5 12c0 1.243 3.358 2.25 7.5 2.25s7.5-1.007 7.5-2.25"
-      )
     when "computer"
       outline_icon(
         classes,
@@ -219,11 +215,13 @@ module ApplicationHelper
     end
   end
 
-  # The brand logo for an OAuth provider as an inline SVG, or nil when we have
+  # The brand logo for an OAuth provider as inline markup, or nil when we have
   # no logo for it -- callers fall back to showing the provider name as text.
   # Official brand marks keep their own colors (Google's G, Slack's pinwheel);
   # GitHub's mark uses currentColor so it follows the theme.
   def oauth_provider_logo(provider, classes: "size-6")
+    return content_tag(:span, "🌐", class: "#{classes} inline-flex items-center justify-center text-2xl", aria: { hidden: true }) if provider.to_s == "mercator"
+
     paths =
       case provider.to_s
       when "google"
