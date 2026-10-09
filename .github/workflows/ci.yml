@@ -17,7 +17,7 @@ permissions:
 jobs:
   ci_changes:
     name: Detect CI changes
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       migration_order: ${{ steps.filter.outputs.migration_order }}
       harness_server_checks: ${{ steps.filter.outputs.harness_server_checks }}
@@ -183,7 +183,7 @@ jobs:
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -197,7 +197,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -229,7 +229,7 @@ jobs:
 
   company-context-checks:
     name: Company context fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.company_context_checks == 'true'
     defaults:
@@ -269,7 +269,7 @@ jobs:
 
   proxy-sync-checks:
     name: Proxy sync fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.proxy_sync_checks == 'true'
     defaults:
@@ -341,7 +341,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -408,7 +408,7 @@ jobs:
 
   rust-api-postgres:
     name: Rust API migrations on PostgreSQL
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -442,7 +442,7 @@ jobs:
 
   sandbox-tests:
     name: Sandbox Python tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.sandbox_tests == 'true'
     steps:
@@ -465,7 +465,7 @@ jobs:
 
   workflow-python-tests:
     name: Workflow Python tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.workflow_python_tests == 'true'
     steps:
@@ -497,7 +497,7 @@ jobs:
 
   tool-tests:
     name: Tool tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.tool_tests == 'true'
     steps:
@@ -525,7 +525,7 @@ jobs:
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -553,7 +553,7 @@ jobs:
 
   linearbot-tests:
     name: Linearbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -583,7 +583,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -617,7 +617,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -651,7 +651,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ubuntu-latest
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:
@@ -683,7 +683,7 @@ jobs:
 
   ci-success:
     name: CI success
-    runs-on: depot-ubuntu-24.04
+    runs-on: ubuntu-latest
     if: always()
     needs:
       - ci_changes
