@@ -12,7 +12,7 @@ use uuid::Uuid;
 const KEY: &str = "slack:C123:123.456";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/omp");
 
-/// Answers startup before replaying recordings from OMP 18.6.3 against a
+/// Answers startup before replaying recordings from OMP 18.8.6 against a
 /// loopback provider. The background gate pauses before session_settled.
 fn fake_omp(dir: &std::path::Path) -> PathBuf {
     let script = r##"#!/bin/sh

@@ -358,7 +358,7 @@ impl OmpEventNormalizer {
         out
     }
 
-    /// Mirrors OMP v18.6.3 packages/coding-agent/src/modes/rpc/rpc-frame.ts:
+    /// Mirrors OMP v18.8.6 packages/coding-agent/src/modes/rpc/rpc-frame.ts:
     /// one contiguous base64 chunk group, bounded size, exact metadata and JSON.
     fn frame(&mut self, frame: Value) -> Result<Option<Value>> {
         if frame["type"] != "rpc_chunk" {
