@@ -5,8 +5,8 @@
 import { expect, test } from 'bun:test'
 import { authMode, chatgptAccountId, model, providerCredentials, slack, turnTimeoutMs } from '../lib'
 
-// Pi supports API keys only (docs/pages/extend/pi-harness.mdx).
-const harnesses = authMode === 'access_token' ? ['codex', 'claudecode'] : ['codex', 'claudecode', 'pi']
+// Pi and OMP support API keys only (docs/pages/extend/pi-harness.mdx, omp-harness.mdx).
+const harnesses = authMode === 'access_token' ? ['codex', 'claudecode'] : ['codex', 'claudecode', 'pi', 'omp']
 
 for (const harness of harnesses) {
   test.concurrent(`${harness} answers a Slack mention`, async () => {
