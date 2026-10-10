@@ -48,6 +48,10 @@ while IFS= read -r line; do
             printf '{"id":"centaur-open_session","type":"response","command":"open_session","success":true,"data":{"cancelled":%s}}\n' "$cancelled"
         fi ;;
     prompt)
+        case "$line" in *'"message":"/help"'*)
+            printf '%s\n' '{"type":"response","command":"prompt","success":true,"data":{"agentInvoked":false}}'
+            continue ;;
+        esac
         printf '%s\n' '{"type":"response","command":"prompt","success":true}'
         case "$line" in
         *'"message":"slow"'*) printf '%s\n' '{"type":"tool_execution_start","toolCallId":"slow","toolName":"bash","args":{"command":"sleep 60"}}' ;;
@@ -455,6 +459,15 @@ fn prompt_rejection_retains_child_and_unknown_result_fails() {
             .count(),
         1
     );
+}
+
+#[test]
+fn prompt_handled_without_the_agent_completes_the_turn() {
+    let mut server = Server::new(&[]);
+    let turn = server.turn("/help", json!({}));
+    assert_eq!(status(&turn), "completed");
+    assert!(items(&turn, "item/completed", "agentMessage").is_empty());
+    assert_eq!(status(&server.turn("text", json!({}))), "completed");
 }
 
 #[test]

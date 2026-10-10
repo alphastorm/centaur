@@ -67,6 +67,9 @@ impl HarnessServer for OmpHarness {
         let bin = env::var("CENTAUR_OMP_BIN").unwrap_or_else(|_| "omp".to_string());
         let mut command = ProcessCommand::new(bin);
         command.args(["--mode", "rpc", "--no-ui"]);
+        // harness-server reports this turn's telemetry; OMP would otherwise
+        // export its own duplicate spans to the sandbox's OTLP endpoint.
+        command.env("OTEL_SDK_DISABLED", "true");
         command
     }
 
@@ -288,6 +291,10 @@ impl OmpEventNormalizer {
                 }];
             }
             eprintln!("omp {command} failed: {error}");
+        } else if command == "prompt" && event["data"]["agentInvoked"] == false {
+            // Handled locally (a slash command, extension, or empty input):
+            // no prompt_result follows, so the turn ends here.
+            return vec![NormalizedEvent::Result { error: None }];
         }
         Vec::new()
     }
