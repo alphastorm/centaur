@@ -226,8 +226,21 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     && kache --version
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
-RUN bun install -g "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
-    && omp --version | grep -Fx "omp/${OMP_VERSION}"
+# Optional and peer dependencies are OMP's local-model features (onnxruntime,
+# transformers, speech), off by default and about 600 MB. Omitting them also
+# omits pi-natives' platform addon, so that is installed explicitly. Bun still
+# downloads them into its cache, which is dropped; the install keeps its files.
+RUN set -eux; \
+    omp_platform="$(case "$(dpkg --print-architecture)" in \
+      amd64) echo linux-x64 ;; \
+      arm64) echo linux-arm64 ;; \
+      *) echo unsupported-architecture >&2; exit 1 ;; \
+    esac)"; \
+    bun install -g --omit=optional --omit=peer \
+      "@oh-my-pi/pi-coding-agent@${OMP_VERSION}" \
+      "@oh-my-pi/pi-natives-${omp_platform}@${OMP_VERSION}"; \
+    rm -rf "$HOME/.bun/install/cache"; \
+    omp --version | grep -Fx "omp/${OMP_VERSION}"
 RUN --mount=type=cache,target=/home/agent/.cache/uv,uid=1001,gid=1001,sharing=locked \
     uv tool install "manim==${MANIM_VERSION}" \
     && manim --version
