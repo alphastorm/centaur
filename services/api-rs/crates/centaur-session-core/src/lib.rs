@@ -549,6 +549,29 @@ pub struct SessionEvent {
     pub created_at: OffsetDateTime,
 }
 
+/// Public request state. Responses are never stored here or in session events.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UserInputRequest {
+    pub execution_id: String,
+    pub request_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub questions: Value,
+    pub status: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub resolved_at: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserInputAnswer {
+    pub answers: Vec<String>,
+}
+
+pub type UserInputAnswers = std::collections::BTreeMap<String, UserInputAnswer>;
+
 pub fn empty_object() -> Value {
     Value::Object(serde_json::Map::new())
 }

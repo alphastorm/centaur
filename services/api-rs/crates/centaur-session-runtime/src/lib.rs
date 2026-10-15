@@ -1,6 +1,7 @@
 mod cleanup;
 mod retention;
 mod title_generator;
+mod user_input;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -558,6 +559,10 @@ impl SessionExecutionAttemptError {
 struct SessionPipe {
     stdin: Arc<Mutex<SessionInputSink>>,
     instance_id: Option<String>,
+    /// A fresh identity for each attach; answers never follow a replacement.
+    pipe_id: String,
+    /// Serializes request responses against stdout terminal/loss observations.
+    response_gate: Arc<Mutex<bool>>,
 }
 
 #[derive(Serialize)]
@@ -3431,6 +3436,9 @@ impl SessionRuntime {
                 .into_parts();
             let pipe = session_pipe_from_parts(io.stdin, io.instance_id);
 
+            self.store
+                .expire_pipe_user_input_requests(thread_key, &pipe.pipe_id, true)
+                .await?;
             self.sandbox_pipes
                 .insert(sandbox_id.to_owned(), pipe.clone());
             drop(_open_guard);
@@ -4496,6 +4504,8 @@ fn session_pipe_from_parts(stdin: SandboxWrite, instance_id: Option<String>) -> 
     SessionPipe {
         stdin: Arc::new(Mutex::new(FramedWrite::new(stdin, LinesCodec::new()))),
         instance_id,
+        pipe_id: Uuid::new_v4().to_string(),
+        response_gate: Arc::new(Mutex::new(true)),
     }
 }
 
@@ -4558,8 +4568,26 @@ fn spawn_stdout_pump_loop(state: StdoutPumpLoop) {
         let mut last_reattach_detail = "stdout reattach attempts exhausted".to_owned();
 
         'pump: loop {
-            let result =
-                run_stdout_pump(ctx.clone(), thread_key.clone(), &sandbox_id, stdout, guard).await;
+            let result = run_stdout_pump(
+                ctx.clone(),
+                thread_key.clone(),
+                &sandbox_id,
+                &pipe,
+                stdout,
+                guard,
+            )
+            .await;
+            {
+                let mut live = pipe.response_gate.lock().await;
+                *live = false;
+                if let Err(error) = ctx
+                    .store
+                    .expire_pipe_user_input_requests(&thread_key, &pipe.pipe_id, false)
+                    .await
+                {
+                    warn!(%error, "failed to expire detached user input requests");
+                }
+            }
             let (execution, lines_pumped) = match result {
                 Ok(StdoutPumpEnd::Idle) => break,
                 Ok(StdoutPumpEnd::EofActiveExecution {
@@ -4927,6 +4955,7 @@ async fn run_stdout_pump(
     ctx: RuntimeContext,
     thread_key: ThreadKey,
     sandbox_id: &str,
+    pipe: &SessionPipe,
     stdout: SandboxRead,
     _guard: SandboxIoGuard,
 ) -> Result<StdoutPumpEnd, SessionRuntimeError> {
@@ -4952,6 +4981,10 @@ async fn run_stdout_pump(
         let mut reported_lost_stdout_ownership = HashSet::new();
         let mut line_count = 0_u64;
         while let Some(line) = stdout.next().await {
+            let _response_guard = pipe.response_gate.lock().await;
+            if !*_response_guard {
+                return Ok(StdoutPumpEnd::Idle);
+            }
             let line = match line {
                 Ok(line) => line,
                 Err(error) => {
@@ -5005,6 +5038,7 @@ async fn run_stdout_pump(
                 &thread_key,
                 &output_execution_id,
                 &line,
+                &pipe.pipe_id,
             )
             .instrument(output_span.clone())
             .await?
@@ -5060,6 +5094,13 @@ async fn run_stdout_pump(
                 ctx.execution_spans.lock().await.remove(&output_execution_id);
                 output_state.forget(&output_execution_id);
             }
+        }
+        {
+            let mut live = pipe.response_gate.lock().await;
+            *live = false;
+            ctx.store
+                .expire_pipe_user_input_requests(&thread_key, &pipe.pipe_id, false)
+                .await?;
         }
         let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
         ctx.store
@@ -5222,6 +5263,9 @@ struct StdoutPumpState {
     first_token_recorded_by_execution: HashSet<String>,
     turn_execution_by_id: HashMap<String, String>,
     item_execution_by_id: HashMap<String, String>,
+    // Keep request bindings until this pipe closes: resolved notifications have
+    // no turn/item id and can arrive after the next execution has started.
+    request_execution_by_id: HashMap<String, String>,
     stdout_span_by_execution: HashMap<String, Span>,
 }
 
@@ -5339,6 +5383,11 @@ impl StdoutPumpState {
     }
 
     fn known_execution_for_value(&self, value: &Value) -> Option<String> {
+        if let Some(id) = user_input::output_request_id(value)
+            && let Some(execution_id) = self.request_execution_by_id.get(&id)
+        {
+            return Some(execution_id.clone());
+        }
         for turn_id in turn_ids(value) {
             if let Some(execution_id) = self.turn_execution_by_id.get(&turn_id) {
                 return Some(execution_id.clone());
@@ -5353,6 +5402,10 @@ impl StdoutPumpState {
     }
 
     fn remember_value_execution(&mut self, value: &Value, execution_id: &str) {
+        if let Some(id) = user_input::output_request_id(value) {
+            self.request_execution_by_id
+                .insert(id, execution_id.to_owned());
+        }
         for turn_id in turn_ids(value) {
             self.turn_execution_by_id
                 .insert(turn_id, execution_id.to_owned());
@@ -6860,6 +6913,7 @@ async fn append_output_line(
     thread_key: &ThreadKey,
     execution_id: &str,
     line: &str,
+    pipe_id: &str,
 ) -> Result<Option<SessionEvent>, SessionRuntimeError> {
     let safe_line = redact_sensitive_text(line);
     let event = ctx
@@ -6873,6 +6927,9 @@ async fn append_output_line(
             Value::String(safe_line),
         )
         .await?;
+    if event.is_some() {
+        user_input::record_request_output(ctx, thread_key, execution_id, pipe_id, line).await?;
+    }
     Ok(event)
 }
 
@@ -9667,6 +9724,593 @@ mod adoption_tests {
             SandboxRuntime::backend(backend, SandboxSpec::new("mock")),
             TestSessionPrincipalRegistrar,
         )
+    }
+
+    struct UserInputFixture {
+        runtime: SessionRuntime,
+        backend: Arc<MockBackend>,
+        thread: ThreadKey,
+        execution: String,
+        stdout: DuplexStream,
+        stdin: FramedRead<DuplexStream, LinesCodec>,
+    }
+
+    async fn user_input_fixture(store: &PgSessionStore, rpc_id: Value) -> UserInputFixture {
+        let thread = ThreadKey::parse(format!("test:user-input-{}", Uuid::new_v4())).unwrap();
+        let execution = orphaned_execution(store, &thread, Some("mock-sbx"), true).await;
+        let (io, mut stdout, stdin) = mock_io();
+        let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
+        backend.push_io(io).await;
+        let runtime = runtime_with(store, backend.clone());
+        claim_test_stdout_owner(&runtime, &execution).await;
+        runtime
+            .ensure_session_pipe(&thread, "mock-sbx")
+            .await
+            .unwrap();
+        let request = json!({
+            "id": rpc_id,
+            "method": "item/tool/requestUserInput",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-1", "itemId": "item-1",
+                "questions": [{
+                    "id": "question-1", "header": "Choice", "question": "Choose a value",
+                    "isOther": true, "isSecret": false,
+                    "options": [{"label": "first", "description": "First option"}]
+                }]
+            }
+        });
+        stdout
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        wait_for_event(store, &thread, "session.user_input_requested").await;
+        UserInputFixture {
+            runtime,
+            backend,
+            thread,
+            execution,
+            stdout,
+            stdin: FramedRead::new(stdin, LinesCodec::new()),
+        }
+    }
+
+    fn user_input_answers() -> centaur_session_core::UserInputAnswers {
+        serde_json::from_value(json!({"question-1": {"answers": ["private answer"]}})).unwrap()
+    }
+
+    async fn finish_user_input_fixture(store: &PgSessionStore, fixture: &mut UserInputFixture) {
+        fixture.stdout.write_all(
+            b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"thread-1\",\"turn\":{\"id\":\"turn-1\",\"status\":\"completed\"}}}\n"
+        ).await.unwrap();
+        wait_for_event(store, &fixture.thread, "session.execution_completed").await;
+    }
+
+    #[tokio::test]
+    async fn user_input_is_persisted_and_replayable_from_pumped_output() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        let requests = fixture
+            .runtime
+            .user_input_requests(&fixture.thread, &fixture.execution)
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].request_id, "request-1");
+        assert_eq!(requests[0].status, "pending");
+        assert_eq!(requests[0].thread_id, "thread-1");
+        assert_eq!(requests[0].turn_id, "turn-1");
+        assert_eq!(requests[0].item_id, "item-1");
+        let mut replay = Box::pin(
+            fixture
+                .runtime
+                .stream_events(&fixture.thread, 0, Some(&fixture.execution))
+                .await
+                .unwrap(),
+        );
+        let event = timeout(Duration::from_secs(5), async {
+            loop {
+                let event = replay.next().await.unwrap().unwrap();
+                if event.event_type == "session.user_input_requested" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            event.execution_id.as_deref(),
+            Some(fixture.execution.as_str())
+        );
+        assert_eq!(
+            event.payload,
+            json!({
+                "execution_id": fixture.execution, "request_id": "request-1",
+                "thread_id": "thread-1", "turn_id": "turn-1", "item_id": "item-1",
+                "questions": requests[0].questions
+            })
+        );
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_answer_is_one_rpc_line_and_duplicates_are_rejected() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        let (first, second) = tokio::join!(
+            fixture.runtime.answer_user_input_request(
+                &fixture.execution,
+                "request-1",
+                user_input_answers(),
+                "test-ingress"
+            ),
+            fixture.runtime.answer_user_input_request(
+                &fixture.execution,
+                "request-1",
+                user_input_answers(),
+                "test-ingress"
+            ),
+        );
+        assert!(first.is_ok() ^ second.is_ok());
+        assert!(matches!(
+            first.err().or(second.err()).unwrap(),
+            SessionRuntimeError::Store(SessionStoreError::UserInputConflict)
+        ));
+        let line = timeout(Duration::from_secs(5), fixture.stdin.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({
+                "id": "request-1", "result": {"answers": user_input_answers()}
+            })
+        );
+        assert!(
+            timeout(Duration::from_millis(50), fixture.stdin.next())
+                .await
+                .is_err()
+        );
+        let audit: (String, String, String) = sqlx::query_as(
+            "select status, answer_digest, actor from session_user_input_requests
+             where execution_id = $1 and request_id = 'request-1'",
+        )
+        .bind(&fixture.execution)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(audit.0, "answered");
+        assert_eq!(audit.1.len(), 64);
+        assert_eq!(audit.2, "test-ingress");
+        let persisted: Value = sqlx::query_scalar(
+            "select to_jsonb(r) from session_user_input_requests r where execution_id = $1",
+        )
+        .bind(&fixture.execution)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert!(!persisted.to_string().contains("private answer"));
+        assert!(
+            !serde_json::to_string(&events(&store, &fixture.thread).await)
+                .unwrap()
+                .contains("private answer")
+        );
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_invalid_answers_and_unknown_request_do_not_consume() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    Default::default(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::BadRequest(_))
+        ));
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "missing",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputNotFound
+            ))
+        ));
+        assert_eq!(
+            store.user_input_requests(&fixture.execution).await.unwrap()[0].status,
+            "pending"
+        );
+        assert!(
+            timeout(Duration::from_millis(50), fixture.stdin.next())
+                .await
+                .is_err()
+        );
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_bulk_expiration_and_resolution_share_execution_lock_order() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        let pipe = fixture
+            .runtime
+            .sandbox_pipes
+            .get("mock-sbx")
+            .unwrap()
+            .clone();
+        store
+            .record_user_input_request(
+                &fixture.thread,
+                &fixture.execution,
+                &fixture.runtime.stdout_owner_id,
+                &pipe.pipe_id,
+                &centaur_session_sqlx::NewUserInputRequest {
+                    request_id: "request-2".to_owned(),
+                    rpc_id: json!("request-2"),
+                    thread_id: "thread-1".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    item_id: "item-2".to_owned(),
+                    questions: json!([]),
+                },
+            )
+            .await
+            .unwrap();
+        let (expired, resolved) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                store.expire_pipe_user_input_requests(&fixture.thread, &pipe.pipe_id, false),
+                store.resolve_user_input_request(&fixture.execution, "request-2", &pipe.pipe_id),
+            )
+        })
+        .await
+        .unwrap();
+        expired.unwrap();
+        resolved.unwrap();
+        assert!(
+            store
+                .user_input_requests(&fixture.execution)
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.status != "pending")
+        );
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_decline_preserves_numeric_rpc_id() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!(42)).await;
+        fixture
+            .runtime
+            .cancel_user_input_request(&fixture.execution, "42", "test-ingress")
+            .await
+            .unwrap();
+        let line = timeout(Duration::from_secs(5), fixture.stdin.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"id":42, "error":{"code":-32000,"message":"User declined"}})
+        );
+        let requests = store.user_input_requests(&fixture.execution).await.unwrap();
+        assert_eq!(requests[0].status, "cancelled");
+        assert_eq!(requests[0].reason.as_deref(), Some("user_declined"));
+        assert!(
+            fixture
+                .runtime
+                .cancel_user_input_request(&fixture.execution, "42", "test-ingress")
+                .await
+                .is_err()
+        );
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_terminal_turns_expire_pending_requests() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        for status in ["completed", "interrupted"] {
+            let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+            let terminal = json!({"method":"turn/completed","params":{
+                "threadId":"thread-1","turn":{"id":"turn-1","status":status}
+            }});
+            fixture
+                .stdout
+                .write_all(format!("{terminal}\n").as_bytes())
+                .await
+                .unwrap();
+            wait_for_event(&store, &fixture.thread, "session.user_input_resolved").await;
+            let requests = store.user_input_requests(&fixture.execution).await.unwrap();
+            assert_eq!(requests[0].status, "expired");
+            assert!(
+                requests[0]
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("execution_")
+            );
+            assert!(matches!(
+                fixture
+                    .runtime
+                    .answer_user_input_request(
+                        &fixture.execution,
+                        "request-1",
+                        user_input_answers(),
+                        "test-ingress"
+                    )
+                    .await,
+                Err(SessionRuntimeError::Store(
+                    SessionStoreError::UserInputConflict
+                ))
+            ));
+            assert!(
+                timeout(Duration::from_millis(50), fixture.stdin.next())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_server_resolution_rejects_late_answer() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        fixture.stdout.write_all(
+            b"{\"method\":\"serverRequest/resolved\",\"params\":{\"threadId\":\"thread-1\",\"requestId\":\"request-1\"}}\n"
+        ).await.unwrap();
+        wait_for_event(&store, &fixture.thread, "session.user_input_resolved").await;
+        assert_eq!(
+            store.user_input_requests(&fixture.execution).await.unwrap()[0].status,
+            "resolved"
+        );
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_process_loss_expires_without_reopening_a_pipe() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let fixture = user_input_fixture(&store, json!("request-1")).await;
+        fixture.backend.set_instance_id("replacement-instance");
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        let requests = store.user_input_requests(&fixture.execution).await.unwrap();
+        assert_eq!(requests[0].status, "expired");
+        assert_eq!(requests[0].reason.as_deref(), Some("pipe_lost"));
+        assert_eq!(fixture.backend.opens(), 1);
+        drop(fixture.stdout);
+        wait_for_event(&store, &fixture.thread, "session.execution_failed").await;
+    }
+
+    #[tokio::test]
+    async fn user_input_eof_expires_and_replacement_pipe_cannot_receive_old_answer() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let fixture = user_input_fixture(&store, json!("request-1")).await;
+        let (io, mut next_stdout, next_stdin) = mock_io();
+        fixture.backend.ios.lock().await.push_back(io);
+        drop(fixture.stdout);
+        wait_for_opens(&fixture.backend, 2).await;
+        wait_for_event(&store, &fixture.thread, "session.user_input_resolved").await;
+        assert_eq!(
+            store.user_input_requests(&fixture.execution).await.unwrap()[0].status,
+            "expired"
+        );
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        let mut next_stdin = FramedRead::new(next_stdin, LinesCodec::new());
+        assert!(
+            timeout(Duration::from_millis(50), next_stdin.next())
+                .await
+                .is_err()
+        );
+        next_stdout
+            .write_all(&completed_output_bytes("done"))
+            .await
+            .unwrap();
+        wait_for_event(&store, &fixture.thread, "session.execution_completed").await;
+    }
+
+    #[tokio::test]
+    async fn user_input_lost_stdout_ownership_cannot_answer() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        store
+            .release_stdout_owner(&fixture.execution, &fixture.runtime.stdout_owner_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), fixture.stdin.next())
+                .await
+                .is_err()
+        );
+        claim_test_stdout_owner(&fixture.runtime, &fixture.execution).await;
+        finish_user_input_fixture(&store, &mut fixture).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_foreign_execution_and_thread_are_rejected() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut original = user_input_fixture(&store, json!("request-original")).await;
+        let mut foreign = user_input_fixture(&store, json!("request-foreign")).await;
+        assert!(matches!(
+            foreign
+                .runtime
+                .answer_user_input_request(
+                    &foreign.execution,
+                    "request-original",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        assert!(matches!(
+            original
+                .runtime
+                .user_input_requests(&foreign.thread, &original.execution)
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputNotFound
+            ))
+        ));
+        assert!(
+            timeout(Duration::from_millis(50), foreign.stdin.next())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .user_input_requests(&original.execution)
+                .await
+                .unwrap()[0]
+                .status,
+            "pending"
+        );
+        finish_user_input_fixture(&store, &mut original).await;
+        finish_user_input_fixture(&store, &mut foreign).await;
+    }
+
+    #[tokio::test]
+    async fn user_input_write_failure_is_terminal_and_does_not_retry() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let _serial = TEST_LOCK.lock().await;
+        let mut fixture = user_input_fixture(&store, json!("request-1")).await;
+        let (_, replacement) = tokio::io::duplex(1);
+        drop(std::mem::replace(
+            &mut fixture.stdin,
+            FramedRead::new(replacement, LinesCodec::new()),
+        ));
+        assert!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await
+                .is_err()
+        );
+        let requests = store.user_input_requests(&fixture.execution).await.unwrap();
+        assert_eq!(requests[0].status, "delivery_failed");
+        assert_eq!(requests[0].reason.as_deref(), Some("response_write_failed"));
+        assert!(matches!(
+            fixture
+                .runtime
+                .answer_user_input_request(
+                    &fixture.execution,
+                    "request-1",
+                    user_input_answers(),
+                    "test-ingress"
+                )
+                .await,
+            Err(SessionRuntimeError::Store(
+                SessionStoreError::UserInputConflict
+            ))
+        ));
+        finish_user_input_fixture(&store, &mut fixture).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

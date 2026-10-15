@@ -19,8 +19,10 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 use uuid::Uuid;
 
 mod migrations;
+mod user_input;
 
 pub use migrations::{TextSearchBackend, migrate, migration_list};
+pub use user_input::NewUserInputRequest;
 
 pub const SESSION_EVENTS_CHANNEL: &str = "centaur_session_events";
 const DEFAULT_MAX_CONNECTIONS: u32 = 500;
@@ -419,6 +421,24 @@ impl PgSessionStore {
         .await?;
 
         row.try_into()
+    }
+
+    pub async fn get_execution(
+        &self,
+        execution_id: &str,
+    ) -> Result<SessionExecution, SessionStoreError> {
+        sqlx::query_as::<_, SessionExecutionRow>(
+            "select execution_id, idempotency_key, thread_key, status, metadata, error,
+                    created_at, updated_at, started_at, completed_at
+             from session_executions where execution_id = $1",
+        )
+        .bind(execution_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| SessionStoreError::ExecutionNotFound {
+            execution_id: execution_id.to_owned(),
+        })?
+        .try_into()
     }
 
     pub async fn execution_request(&self, execution_id: &str) -> Result<Value, SessionStoreError> {
@@ -1754,6 +1774,10 @@ pub enum SessionStoreError {
     InvalidPersistedValue(String),
     #[error("session execution not found for execution_id {execution_id}")]
     ExecutionNotFound { execution_id: String },
+    #[error("user input request not found")]
+    UserInputNotFound,
+    #[error("user input request is no longer pending on this execution and pipe")]
+    UserInputConflict,
     #[error("invalid notification payload on {channel}: {payload}: {error}")]
     InvalidNotification {
         channel: String,
