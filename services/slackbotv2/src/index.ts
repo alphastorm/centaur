@@ -15,6 +15,7 @@ import {
   type Thread
 } from 'chat'
 import { createSlackAdapter } from '@chat-adapter/slack'
+import { verifySlackSignature } from '@chat-adapter/slack/webhook'
 import {
   assertSlackOk,
   callSlackApi,
@@ -67,6 +68,12 @@ import {
   type SlackContextBlock
 } from './response-context'
 import { resolveChannelDefault } from './channel-defaults'
+import {
+  createSlackUserInputBridge,
+  isUserInputInteraction,
+  observeUserInputEvents,
+  pinSlackSessionRequester
+} from './user-input'
 import {
   extractMessageOverrides,
   extractPersonaOverride,
@@ -324,6 +331,9 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
     logger
   })
   const state = options.state ?? createDefaultState(options, logger)
+  // Render/recovery helpers must use the same durable state as interactions.
+  options = { ...options, state }
+  const userInput = createSlackUserInputBridge(options, state)
   const chat = new Chat<{ slack: typeof slack }, SlackbotV2ThreadState>({
     userName,
     adapters: { slack },
@@ -548,6 +558,23 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
         return new globalThis.Response('ok', { status: 200 })
       }
       const interaction = parseSlackWebhookPayload(rawBody)
+      if (isUserInputInteraction(interaction)) {
+        try {
+          await verifySlackSignature(rawBody, c.req.raw.headers, {
+            signingSecret: options.signingSecret
+          })
+        } catch {
+          outcome = 'error'
+          return new globalThis.Response('Invalid signature', { status: 401 })
+        }
+        await stateConnected
+        return await userInput.handleInteraction(interaction!, task => {
+          waitUntil(c, task.catch(() => {
+            // Do not log payloads or upstream bodies containing answer text.
+            traceWarn(options, 'slackbotv2_user_input_interaction_failed', undefined, {})
+          }))
+        })
+      }
       const workflowAction = interaction?.type === 'block_actions'
         && Array.isArray(interaction.actions)
         && interaction.actions.some(action => isJsonObject(action)
@@ -1232,6 +1259,10 @@ async function syncThreadMessageToSession(
 
   const serializeStartedAtMs = nowMs()
   const serializedMessage = await serializeMessage(message, input.options)
+  if (!state.historyForwarded && !state.forwardedMessageIds?.length
+    && !state.executedMessageIds?.length && !state.lastEventId && !state.renderObligation) {
+    await pinSlackSessionRequester(input.state, thread.id, serializedMessage)
+  }
   // Inspect the original text before the strategy strips recognized flags.
   // This is the authority for whether a sticky thread selection may change.
   const explicitOverrides = extractMessageOverrides(serializedMessage.text)
@@ -1862,6 +1893,7 @@ async function renderExecutionAttempt(
         {
           afterEventId: input.afterEventId,
           executionId: input.executionId,
+          message,
           threadId: input.threadId
         },
         trace,
@@ -1952,6 +1984,7 @@ async function renderExecutionAttempt(
       {
         afterEventId: input.afterEventId,
         executionId: input.executionId,
+        message,
         threadId: input.threadId
       },
       trace,
@@ -2072,7 +2105,12 @@ const FALLBACK_OPEN_MAX_ATTEMPTS = 4
 async function renderFallbackFinalAnswer(
   thread: Thread,
   options: SlackbotV2Options,
-  source: { afterEventId: number; executionId?: string; threadId: string },
+  source: {
+    afterEventId: number
+    executionId?: string
+    message: SlackbotV2ApiMessage
+    threadId: string
+  },
   trace?: SlackbotV2Trace,
   replacement?: { replaceMessageId: string }
 ): Promise<{ lastEventId: number } | null> {
@@ -2104,7 +2142,7 @@ async function renderFallbackFinalAnswer(
     const chatStream = fallback.collectChatSdk(
       slackSafeChatSdkStream(
         harnessToChatSdkStream(
-          fallback.collectSource(stream),
+          fallback.collectSource(observeUserInputEvents(options, source, stream)),
           fallbackRendererOptions(options)
         )
       )
@@ -2471,7 +2509,11 @@ async function recoverRenderObligation(
     })
     const streamResult = await renderRecoveredExecutionStream(
       thread,
-      streamOpenedSession(input, openedStream),
+      observeUserInputEvents(
+        options,
+        { ...input, message: obligation.message },
+        openedStream
+      ),
       obligation.message,
       options,
       trace
@@ -2489,7 +2531,8 @@ async function recoverRenderObligation(
         {
           afterEventId: obligation.afterEventId,
           executionId: obligation.executionId,
-          threadId
+          message: obligation.message,
+          threadId,
         },
         trace,
         { replaceMessageId: streamResult.messageId }
@@ -2551,6 +2594,7 @@ async function recoverRenderObligation(
         {
           afterEventId: obligation.afterEventId,
           executionId: obligation.executionId,
+          message: obligation.message,
           threadId
         },
         trace,
@@ -2591,13 +2635,6 @@ async function indexRenderObligation(
   })
   slackbotMetrics.renderObligationsIndexed.inc()
   traceLog(input.options, 'slackbotv2_render_obligation_indexed', input.trace)
-}
-
-async function* streamOpenedSession(
-  _input: Pick<ForwardSessionInput, 'threadId' | 'trace'>,
-  stream: AsyncIterable<SlackbotV2RendererSource>
-): AsyncIterable<SlackbotV2RendererSource> {
-  for await (const event of stream) yield event
 }
 
 function renderRecoveryLeaseKey(threadId: string): string {
@@ -3063,7 +3100,11 @@ async function* streamSessionAfterHandoff(
     return
   }
 
-  for await (const event of stream) yield event
+  for await (const event of observeUserInputEvents(
+    options,
+    { ...input, message: input.executeMessage },
+    stream
+  )) yield event
 }
 
 async function* streamError(error: unknown): AsyncIterable<SlackbotV2RendererSource> {

@@ -569,6 +569,39 @@ export async function forwardToSessionApi(
 
 export const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.action:'
 
+export async function answerSessionUserInput(
+  options: SlackbotV2Options,
+  threadId: string,
+  executionId: string,
+  requestId: string,
+  answers: Record<string, { answers: string[] }>
+): Promise<204 | 404 | 409> {
+  const action = 'answer session user input'
+  const path = `/api/session/${encodeURIComponent(threadId)}`
+    + `/executions/${encodeURIComponent(executionId)}/user-input/${encodeURIComponent(requestId)}`
+  const response = await recordSessionApiOperation('answer_user_input', () =>
+    fetchWithTimeout(
+      options.fetch ?? globalThis.fetch,
+      new URL(path, ensureTrailingSlash(options.apiUrl)),
+      {
+        body: JSON.stringify({ answers }),
+        headers: apiHeaders(options),
+        method: 'POST'
+      },
+      sessionApiTimeoutMs(options),
+      action
+    ),
+    sessionApiTimeoutMs(options),
+    action
+  )
+  await response.body?.cancel()
+  if (response.status === 204 || response.status === 404 || response.status === 409) {
+    return response.status
+  }
+  // Never include response bodies here: an upstream error could echo the answer.
+  throw new Error('Session user input delivery could not be confirmed')
+}
+
 export async function dispatchSlackBlockAction(
   options: SlackbotV2Options,
   payload: SlackbotV2BlockActionPayload
@@ -2051,7 +2084,11 @@ async function* parseSessionEventStream(
       if (isTerminalCodexOutputLine(event.data)) return
       continue
     }
-    if (event.event === 'session.activity_summary') {
+    if (
+      event.event === 'session.activity_summary'
+      || event.event === 'session.user_input_requested'
+      || event.event === 'session.user_input_resolved'
+    ) {
       yield {
         data: sessionEventData(event),
         event: event.event,

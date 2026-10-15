@@ -184,6 +184,19 @@ Execution tuning:
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
 
+### Answering agent questions
+
+When an agent needs a decision, Slackbot posts a question card in the originating
+thread. Only the session's requesting user can choose an option or use **Answer…**
+for a free-text response. Longer lists are paged within the same card; requests
+with several questions collect every answer before submitting once. Do not enter
+tokens, passwords, or private keys: token-like answers are refused. Answered,
+cancelled, and expired cards no longer accept responses. Correlations and one-shot
+submission claims use the same Postgres-backed state as Slackbot's render recovery;
+an unconfirmed delivery is not retried automatically. Older sessions without a
+recorded requesting user show a noninteractive card; start a fresh thread to use
+agent questions.
+
 ## Teamsbot
 
 | Env var | Set from | Controls |

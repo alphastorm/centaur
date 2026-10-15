@@ -429,6 +429,66 @@ describe('slackbotv2', () => {
     expect(codexApi.workflowEvents).toHaveLength(1)
   })
 
+  it('renders an agent question from a signed mention and applies its signed answer once', async () => {
+    const answers: Record<string, unknown>[] = []
+    bot = createTestBot({
+      fetch: async (input, init) => {
+        if (String(input).includes('/executions/') && String(input).includes('/user-input/')) {
+          answers.push(JSON.parse(String(init?.body)))
+          return new Response(null, { status: 204 })
+        }
+        return globalThis.fetch(input, init)
+      }
+    })
+    codexApi.autoRespond = false
+    const parent = await postUserMessage('Context for a question.')
+    const mention = await sendMessage(`<@${BOT_USER_ID}> choose the target`, { threadTs: parent.ts })
+    await waitFor(() => codexApi.eventRequests.length === 1)
+    const executionId = codexApi.eventRequests[0]!.executionId!
+    const key = threadKey(parent.ts)
+    codexApi.emitSessionEvent(key, 'session.user_input_requested', {
+      execution_id: executionId,
+      request_id: 'question-1',
+      questions: [{
+        id: 'target', header: 'Target', question: 'Which environment?',
+        options: [{ label: 'Staging', description: 'Use staging.' }], free_text: false
+      }]
+    }, executionId)
+    let card: Record<string, unknown> | undefined
+    await waitFor(async () => {
+      const replies = await slackBot.conversations.replies({ channel: CHANNEL_ID, ts: parent.ts })
+      card = replies.messages?.find(message => JSON.stringify(message.blocks ?? []).includes('centaur.user-input:')) as Record<string, unknown> | undefined
+      return Boolean(card)
+    })
+    const action = (card!.blocks as Array<{ elements?: Record<string, unknown>[] }>)
+      .flatMap(block => block.elements ?? [])
+      .find(element => String(element.action_id).includes(':option:'))!
+    const interaction = {
+      type: 'block_actions', team: { id: TEAM_ID },
+      user: { id: USER_ID, team_id: TEAM_ID }, channel: { id: CHANNEL_ID },
+      message: { ts: card!.ts, thread_ts: parent.ts },
+      trigger_id: 'fixture-agent-question-trigger',
+      actions: [{ ...action, action_ts: '1700000006.000300' }]
+    }
+    for (let delivery = 0; delivery < 2; delivery++) {
+      const waits: Promise<unknown>[] = []
+      const response = await bot.app.request('/api/slack/actions', signedSlackInteraction(interaction), {}, waitUntilContext(waits))
+      expect(response.status).toBe(200)
+      await Promise.all(waits)
+    }
+    expect(answers).toEqual([{ answers: { target: { answers: ['Staging'] } } }])
+    codexApi.emitSessionEvent(key, 'session.user_input_resolved', {
+      execution_id: executionId, request_id: 'question-1', status: 'answered', reason: null
+    }, executionId)
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Staging selected.'), executionId)
+    await mention.finished()
+    const replies = await slackBot.conversations.replies({ channel: CHANNEL_ID, ts: parent.ts })
+    const resolved = replies.messages?.find(message => message.ts === card!.ts)
+    expect(JSON.stringify(resolved?.blocks)).toContain('Chosen answer: Target: Staging')
+    expect(JSON.stringify(resolved?.blocks)).not.toContain('centaur.user-input:')
+    expect(await threadText(parent.ts)).toContain('Staging selected.')
+  })
+
   // Collecting unmentioned replies into the next turn runs end to end in
   // e2e/tests/context.test.ts; this covers how Slack renders the turn.
   it('renders a mention with an attachment as a plan stream with status and title', async () => {
