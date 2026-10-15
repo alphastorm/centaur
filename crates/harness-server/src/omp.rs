@@ -292,17 +292,26 @@ impl OmpEventNormalizer {
         let Some(event) = self.frame(event)? else {
             return Ok(Vec::new());
         };
-        let mut expired = Vec::new();
+        let mut tool_events = Vec::new();
         if let Some(ui) = self.tool_ui.as_mut() {
             match event["type"].as_str() {
+                Some("message_end") if event["message"]["role"] == "assistant" => {
+                    for block in event["message"]["content"].as_array().into_iter().flatten() {
+                        if block["type"] == "toolCall"
+                            && let Some(id) = block["id"].as_str().filter(|id| !id.is_empty())
+                        {
+                            ui.tool_announced(id);
+                        }
+                    }
+                }
                 Some("extension_ui_request") => return ui.request(event),
                 Some("tool_execution_start") => {
                     if let Some(id) = event["toolCallId"].as_str().filter(|id| !id.is_empty()) {
-                        ui.tool_started(id);
+                        tool_events = ui.tool_started(id)?;
                     }
                 }
                 Some("tool_execution_end") => {
-                    expired = ui.tool_ended(event["toolCallId"].as_str().unwrap_or_default());
+                    tool_events = ui.tool_ended(event["toolCallId"].as_str().unwrap_or_default());
                 }
                 _ => {}
             }
@@ -327,23 +336,27 @@ impl OmpEventNormalizer {
             Some("message_end") if event["message"]["role"] == "assistant" => {
                 self.assistant_message(&event)
             }
-            Some("tool_execution_start") => vec![NormalizedEvent::AssistantMessage {
-                partial: false,
-                stop_reason: None,
-                content: vec![NormalizedContent::ToolUse {
-                    raw_id: event["toolCallId"].as_str().unwrap_or_default().to_string(),
-                    tool: event["toolName"].as_str().unwrap_or_default().to_string(),
-                    arguments: event["args"].clone(),
-                }],
-            }],
+            Some("tool_execution_start") => {
+                let mut events = vec![NormalizedEvent::AssistantMessage {
+                    partial: false,
+                    stop_reason: None,
+                    content: vec![NormalizedContent::ToolUse {
+                        raw_id: event["toolCallId"].as_str().unwrap_or_default().to_string(),
+                        tool: event["toolName"].as_str().unwrap_or_default().to_string(),
+                        arguments: event["args"].clone(),
+                    }],
+                }];
+                events.extend(tool_events);
+                events
+            }
             Some("tool_execution_end") => {
-                expired.push(NormalizedEvent::ToolResults(vec![NormalizedToolResult {
+                tool_events.push(NormalizedEvent::ToolResults(vec![NormalizedToolResult {
                     exit_code: event["result"]["details"]["exitCode"]
                         .as_i64()
                         .and_then(|code| i32::try_from(code).ok()),
                     ..tool_result(&event)
                 }]));
-                expired
+                tool_events
             }
             Some("prompt_result") => {
                 self.waiting_for_settle = event["sessionSettled"] == false;

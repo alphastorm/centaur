@@ -1,4 +1,7 @@
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -11,6 +14,96 @@ use uuid::Uuid;
 
 const KEY: &str = "slack:C123:123.456";
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/omp");
+
+/// abort_sleep and ask_{select,cancel,editor,abort}.jsonl record omp 18.11.0
+/// with exactly `--mode rpc --no-ui` or `--mode rpc-ui --no-ui`. Each entry
+/// preserves a stdin/stdout/stderr line; stderr was empty in all five captures.
+/// Only the temporary session root was replaced with /workspace/fixture.
+///
+/// Recording used an isolated HOME/PI_CODING_AGENT_DIR, a dummy key, and
+/// ANTHROPIC_BASE_URL pointing to a loopback /v1/messages SSE server. Startup
+/// matched OmpHarness, selecting anthropic/claude-sonnet-4-5 with thinking high
+/// and cache warming off. The provider used e2e/fakes/model-server.ts's message
+/// envelope, adding thinking + signature and tool_use blocks (bash sleep 60,
+/// or stock ask with Postgres/SQLite options), then thinking + final text.
+/// Abort was sent after tool_execution_start; ask replies followed the dialog.
+///
+/// Stock ask exposes select and Other's editor, not input/confirm. Those two
+/// methods and transport faults remain synthetic regressions below. Cancelling
+/// stock ask aborts the prompt, unlike the synthetic successful-dialog fixture.
+fn recording(name: &str) -> Vec<Value> {
+    std::fs::read_to_string(format!("{FIXTURES}/{name}.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// Replay every recorded output line, gating on the corresponding input kind.
+/// Field-level answer assertions live in the tests, since the host's session
+/// directory and generated request ids need not equal the recorder's.
+fn recorded_omp(dir: &std::path::Path, name: &str) -> PathBuf {
+    fn quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+    let log = quote(&dir.join("stdin").to_string_lossy());
+    let mut script = format!(
+        "#!/bin/sh\nprintf '%s|%s\\n' \"$$\" \"$*\" >> {}\n",
+        quote(&dir.join("argv").to_string_lossy())
+    );
+    let mut tool_started = false;
+    let mut deferred_input = String::new();
+    for frame in recording(name) {
+        let line = frame["line"].as_str().unwrap();
+        match frame["stream"].as_str().unwrap() {
+            "stdin" => {
+                let input: Value = serde_json::from_str(line).unwrap();
+                let kind = input["type"].as_str().unwrap();
+                // The shared runner also sets thinking before each prompt.
+                let gate = format!(
+                    "while :; do
+    IFS= read -r line || exit 1
+    printf '%s\\n' \"$line\" >> {log}
+    case \"$line\" in
+    *'\"type\":\"{kind}\"'*) break ;;
+    *'\"type\":\"set_thinking_level\"'*) printf '%s\\n' '{{\"type\":\"response\",\"command\":\"set_thinking_level\",\"success\":true}}' ;;
+    *) exit 2 ;;
+    esac
+done"
+                );
+                // Recording replies can race ahead of OMP's independent start
+                // notification. Preserve stdout order, but don't make that
+                // start depend on an answer: the adapter surfaces UI after it.
+                if matches!(kind, "extension_ui_response" | "abort") && !tool_started {
+                    deferred_input = gate;
+                } else {
+                    writeln!(script, "{gate}").unwrap();
+                }
+            }
+            "stdout" => {
+                writeln!(script, "printf '%s\\n' {}", quote(line)).unwrap();
+                let output: Value = serde_json::from_str(line).unwrap();
+                if output["type"] == "tool_execution_start" {
+                    tool_started = true;
+                    writeln!(script, "{deferred_input}").unwrap();
+                    deferred_input.clear();
+                }
+            }
+            "stderr" => writeln!(script, "printf '%s\\n' {} >&2", quote(line)).unwrap(),
+            stream => panic!("unknown recorded stream: {stream}"),
+        }
+    }
+    assert!(deferred_input.is_empty(), "recorded tool never started");
+    writeln!(
+        script,
+        "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {log}; done"
+    )
+    .unwrap();
+    let path = dir.join("omp");
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
 
 /// Answers startup before replaying recordings from OMP 18.8.6 against a
 /// loopback provider. The background gate pauses before session_settled.
@@ -110,6 +203,7 @@ struct Server {
     stdin: Option<ChildStdin>,
     stdout: Receiver<Value>,
     timeout: Duration,
+    active_items: RefCell<BTreeMap<String, String>>,
 }
 
 impl Server {
@@ -122,6 +216,21 @@ impl Server {
         std::fs::create_dir_all(&dir).unwrap();
         let binary = fake_omp(&dir);
         Self::with_binary(dir, mode, binary.as_os_str(), extra_env)
+    }
+
+    fn recorded(name: &str, tool_ui: bool) -> Self {
+        let dir = std::env::temp_dir().join(format!("omp-recorded-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = recorded_omp(&dir, name);
+        Self::with_binary(
+            dir,
+            "blocks",
+            binary.as_os_str(),
+            &[(
+                "CENTAUR_OMP_TOOL_UI",
+                if tool_ui { "true" } else { "false" },
+            )],
+        )
     }
 
     fn with_binary(dir: PathBuf, mode: &str, binary: &OsStr, extra_env: &[(&str, &str)]) -> Self {
@@ -160,6 +269,7 @@ impl Server {
             stdin,
             stdout: rx,
             timeout: Duration::from_secs(10),
+            active_items: RefCell::default(),
         }
     }
 
@@ -184,11 +294,53 @@ impl Server {
                 .stdout
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap();
+            self.check_lifecycle(&value);
             let done = predicate(&value);
             values.push(value);
             if done {
                 return values;
             }
+        }
+    }
+
+    fn check_lifecycle(&self, event: &Value) {
+        let mut active = self.active_items.borrow_mut();
+        let item = &event["params"]["item"];
+        match event["method"].as_str().unwrap_or_default() {
+            "item/started" => {
+                assert!(
+                    active
+                        .insert(
+                            item["id"].as_str().unwrap().to_owned(),
+                            item["type"].as_str().unwrap().to_owned(),
+                        )
+                        .is_none(),
+                    "item started twice: {event}"
+                );
+            }
+            "item/completed" => {
+                assert_eq!(
+                    active.remove(item["id"].as_str().unwrap()).as_deref(),
+                    item["type"].as_str(),
+                    "completion without matching start: {event}"
+                );
+            }
+            "item/agentMessage/delta" | "item/reasoning/textDelta" => {
+                let kind = if event["method"] == "item/agentMessage/delta" {
+                    "agentMessage"
+                } else {
+                    "reasoning"
+                };
+                assert_eq!(
+                    active
+                        .get(event["params"]["itemId"].as_str().unwrap())
+                        .map(String::as_str),
+                    Some(kind),
+                    "delta without matching start: {event}"
+                );
+            }
+            "turn/completed" => assert!(active.is_empty(), "uncompleted items: {active:?}"),
+            _ => {}
         }
     }
 
@@ -700,6 +852,119 @@ fn select_request() -> Value {
 fn answer(request: &Value, text: &str) -> Value {
     let question = request["params"]["questions"][0]["id"].as_str().unwrap();
     json!({"id": request["id"], "result": {"answers": {question: {"answers": [text]}}}})
+}
+
+#[test]
+fn recorded_native_abort_during_bash_and_ask_interrupts_once() {
+    for (scenario, tool_ui) in [("abort_sleep", false), ("ask_abort", true)] {
+        let mut server = Server::recorded(scenario, tool_ui);
+        server.user("recorded", json!({}));
+        server.until(|event| {
+            if tool_ui {
+                event["method"] == "item/tool/requestUserInput"
+            } else {
+                event["method"] == "item/started"
+                    && event["params"]["item"]["type"] == "commandExecution"
+            }
+        });
+        server.send(json!({"type": "interrupt", "thread_key": KEY}));
+        let ended = server.read_until("turn/completed");
+        assert_eq!(status(&ended), "interrupted", "{scenario}");
+        assert_eq!(
+            ended
+                .iter()
+                .filter(|event| event["method"] == "serverRequest/resolved")
+                .count(),
+            usize::from(tool_ui)
+        );
+        assert_eq!(
+            server.commands().last().unwrap(),
+            &json!({"id": "centaur-abort", "type": "abort"})
+        );
+        assert!(
+            server
+                .stdout
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "native abort's late prompt_result escaped the interrupt"
+        );
+    }
+}
+
+#[test]
+fn recorded_native_ask_select_editor_and_cancellation_round_trip() {
+    for scenario in ["ask_select", "ask_editor", "ask_cancel"] {
+        let mut server = Server::recorded(scenario, true);
+        server.user("recorded", json!({}));
+        let mut events = server.read_until("item/tool/requestUserInput");
+        let request = events.last().unwrap().clone();
+        let question = &request["params"]["questions"][0];
+        assert_eq!(question["question"], "Which database?");
+        assert_eq!(question["options"][0]["description"], "Existing database");
+        assert_eq!(
+            request["params"]["itemId"],
+            items(&events, "item/started", "dynamicToolCall")[0]["id"]
+        );
+        match scenario {
+            "ask_cancel" => server.send(
+                json!({"id": request["id"], "error": {"code": -32000, "message": "cancelled"}}),
+            ),
+            "ask_editor" => {
+                server.send(answer(&request, "Other (type your own)"));
+                events.extend(server.read_until("item/tool/requestUserInput"));
+                let editor = events.last().unwrap();
+                assert_eq!(editor["params"]["questions"][0]["isOther"], true);
+                assert!(editor["params"]["questions"][0]["options"].is_null());
+                server.send(answer(editor, "A custom database"));
+            }
+            _ => server.send(answer(&request, "Postgres")),
+        }
+        events.extend(server.read_until("turn/completed"));
+        assert_eq!(
+            status(&events),
+            if scenario == "ask_cancel" {
+                "failed"
+            } else {
+                "completed"
+            }
+        );
+        if scenario == "ask_cancel" {
+            assert_eq!(
+                events.last().unwrap()["params"]["turn"]["error"]["message"],
+                "omp prompt aborted"
+            );
+            assert!(items(&events, "item/completed", "agentMessage").is_empty());
+        } else {
+            assert_eq!(
+                items(&events, "item/completed", "agentMessage")[0]["text"],
+                "Recorded loopback turn complete."
+            );
+            assert_eq!(items(&events, "item/completed", "reasoning").len(), 2);
+        }
+        assert_eq!(items(&events, "item/completed", "dynamicToolCall").len(), 1);
+        let expected: Vec<Value> = recording(scenario)
+            .iter()
+            .filter(|frame| frame["stream"] == "stdin")
+            .map(|frame| serde_json::from_str(frame["line"].as_str().unwrap()).unwrap())
+            .filter(|frame: &Value| frame["type"] == "extension_ui_response")
+            .collect();
+        assert_eq!(
+            server
+                .commands()
+                .into_iter()
+                .filter(|frame| frame["type"] == "extension_ui_response")
+                .collect::<Vec<_>>(),
+            expected
+        );
+        server.send(answer(&request, "Postgres"));
+        assert_eq!(
+            server
+                .until(|event| event["id"] == request["id"])
+                .last()
+                .unwrap()["error"]["code"],
+            -32600
+        );
+    }
 }
 
 #[test]
