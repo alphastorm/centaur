@@ -1111,7 +1111,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     stdout: &mut W,
 ) -> Result<bool> {
     let ActiveTurnRequest::JsonRpc(request) = request else {
-        process.kill_and_wait()?;
+        harness.interrupt_process(process)?;
         return Ok(true);
     };
 
@@ -1184,7 +1184,7 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
                 )?;
                 return Ok(false);
             }
-            process.kill_and_wait()?;
+            harness.interrupt_process(process)?;
             write_client_response(
                 stdout,
                 ClientResponse::TurnInterrupt {
@@ -1511,6 +1511,11 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
     state.process = None;
 
     let mut command = harness.command_for_turn(state);
+    #[cfg(unix)]
+    if harness.isolate_process_group() {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1555,6 +1560,7 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
     });
 
     let mut process = HarnessChild {
+        process_group: harness.isolate_process_group().then_some(child.id()),
         child,
         stdin,
         stdout: stdout_rx,

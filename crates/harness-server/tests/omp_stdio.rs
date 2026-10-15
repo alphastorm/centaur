@@ -54,7 +54,10 @@ while IFS= read -r line; do
         esac
         printf '%s\n' '{"type":"response","command":"prompt","success":true}'
         case "$line" in
-        *'"message":"slow"'*) printf '%s\n' '{"type":"tool_execution_start","toolCallId":"slow","toolName":"bash","args":{"command":"sleep 60"}}' ;;
+        *'"message":"slow"'*)
+            sleep 60 &
+            echo $! > '@DIR@/descendant'
+            printf '%s\n' '{"type":"tool_execution_start","toolCallId":"slow","toolName":"bash","args":{"command":"sleep 60"}}' ;;
         *'"message":"gated_background"'*)
             while IFS= read -r frame; do
                 printf '%s\n' "$frame"
@@ -70,6 +73,14 @@ while IFS= read -r line; do
         *'"message":"custom"'*) cat '@DIR@/turn.jsonl' ;;
         *) cat '@FIXTURES@/text.jsonl' ;;
         esac ;;
+    abort)
+        case "$OMP_TEST_ABORT" in
+        silent) continue ;;
+        race) printf '%s\n' '{"type":"prompt_result","status":"completed","sessionSettled":true}' ;;
+        esac
+        sleep 0.05
+        printf 'acknowledged\n' > '@DIR@/aborted'
+        printf '%s\n' '{"id":"centaur-abort","type":"response","command":"abort","success":true}' ;;
     *) printf '{"type":"response","id":"centaur-%s","command":"%s","success":true}\n' "$kind" "$kind" ;;
     esac
 done
@@ -109,6 +120,8 @@ impl Server {
             .env_remove("CENTAUR_OMP_MODEL")
             .env_remove("CENTAUR_THREAD_KEY")
             .env_remove("OMP_TEST_FAULT")
+            .env_remove("OMP_TEST_ABORT")
+            .env_remove("CENTAUR_OMP_ABORT_TIMEOUT_MS")
             .envs(extra_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -576,6 +589,70 @@ fn interrupt_and_model_switch_reopen_the_same_session() {
                 .to_string_lossy()
                 .as_ref()
         );
+    }
+}
+
+#[test]
+fn cooperative_abort_waits_for_ack_and_preserves_history_without_replay() {
+    for behavior in ["ack", "silent", "race"] {
+        let mut server = Server::new(&[
+            ("OMP_TEST_ABORT", behavior),
+            ("CENTAUR_OMP_ABORT_TIMEOUT_MS", "300"),
+        ]);
+        server.user("slow", json!({}));
+        server.until(|event| {
+            event["method"] == "item/started"
+                && event["params"]["item"]["type"] == "commandExecution"
+        });
+        let history = server
+            .dir
+            .join("sessions/centaur-slack-C123-123.456/history.jsonl");
+        let original = "{\"type\":\"message\",\"text\":\"persisted mutation\"}\n";
+        std::fs::write(&history, original).unwrap();
+        let descendant: i32 = std::fs::read_to_string(server.dir.join("descendant"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let start = Instant::now();
+        server.send(json!({"type": "interrupt", "thread_key": KEY}));
+        let turn = server.read_until("turn/completed");
+        assert_eq!(status(&turn), "interrupted", "{behavior}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.dir.join("aborted").exists(), behavior != "silent");
+        if behavior == "silent" {
+            assert!(start.elapsed() >= Duration::from_millis(300));
+        }
+        assert_eq!(std::fs::read_to_string(&history).unwrap(), original);
+        assert_eq!(
+            server.commands().last().unwrap(),
+            &json!({"id": "centaur-abort", "type": "abort"})
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            // SAFETY: signal zero only checks existence of the fixture sleeper.
+            if unsafe { libc::kill(descendant, 0) } == -1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "descendant survived abort");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            server
+                .stdout
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+        assert_eq!(status(&server.turn("text", json!({}))), "completed");
+        assert_eq!(
+            server
+                .commands()
+                .iter()
+                .filter(|c| c["type"] == "prompt")
+                .count(),
+            2
+        );
+        assert_eq!(std::fs::read_to_string(&history).unwrap(), original);
     }
 }
 

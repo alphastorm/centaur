@@ -44,17 +44,24 @@ pub struct HarnessChild {
     pub model: String,
     /// Reasoning effort last applied in-band; a fresh process runs its default.
     pub reasoning_effort: Option<String>,
+    /// Private process group, taken on termination so Drop cannot signal it twice.
+    pub process_group: Option<u32>,
 }
 
 impl Drop for HarnessChild {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.kill_and_wait();
     }
 }
 
 impl HarnessChild {
     pub fn kill_and_wait(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group.take() {
+            // SAFETY: the runner created this private group with the child's
+            // PID. Signal it even if the leader exited: tools may still live.
+            unsafe { libc::kill(-(group as libc::pid_t), libc::SIGKILL) };
+        }
         let _ = self.child.kill();
         self.child.wait().map(|_| ())
     }
@@ -73,6 +80,16 @@ pub trait HarnessServer {
     fn default_model(&self) -> String;
     fn default_model_provider(&self) -> &'static str;
     fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand;
+    /// Isolate descendants so teardown also stops tools outliving their parent.
+    fn isolate_process_group(&self) -> bool {
+        false
+    }
+    /// Interrupt the active turn before destroying its process. Returning from
+    /// this hook never completes the turn successfully, even if output raced it.
+    fn interrupt_process(&self, process: &mut HarnessChild) -> Result<()> {
+        process.kill_and_wait()?;
+        Ok(())
+    }
     /// Initializes a freshly spawned process. No startup I/O by default.
     fn on_process_start(&self, _state: &ThreadState, _process: &mut HarnessChild) -> Result<()> {
         Ok(())

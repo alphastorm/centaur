@@ -7,6 +7,10 @@
 //! or on `session_settled` when background work still owes a follow-up. OMP saves
 //! the session in a per-thread directory, so a respawn after an interrupt, crash,
 //! or model switch resumes the conversation.
+//! Interrupt sends `abort`, waits for its correlated response (which follows
+//! session.abort), then kills the private process group. The grace period is
+//! `CENTAUR_OMP_ABORT_TIMEOUT_MS` (default 2000, maximum 30000). No input is
+//! replayed, and the saved session is never rewritten by harness-server.
 //!
 //! OMP reads provider API keys from the environment, where the sandbox holds
 //! iron-proxy placeholders that the proxy replaces on the wire.
@@ -132,6 +136,29 @@ impl HarnessServer for OmpHarness {
         true
     }
 
+    fn isolate_process_group(&self) -> bool {
+        true
+    }
+
+    fn interrupt_process(&self, process: &mut HarnessChild) -> Result<()> {
+        let timeout = env::var("CENTAUR_OMP_ABORT_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(2000)
+            .min(30_000);
+        // Consume, but never publish, late completion while abort is in flight.
+        // Even a missing/failed acknowledgement must still tear down the group.
+        let _ = rpc_command(
+            process,
+            &mut OmpEventNormalizer::default(),
+            "abort",
+            json!({}),
+            Duration::from_millis(timeout),
+        );
+        process.kill_and_wait()?;
+        Ok(())
+    }
+
     fn validate_model(&self, model: &str) -> std::result::Result<(), String> {
         split_model(model).map(|_| ()).ok_or_else(|| {
             format!("unsupported model `{model}` for OMP: expected provider/modelId")
@@ -183,14 +210,24 @@ fn startup_command(
     process: &mut HarnessChild,
     normalizer: &mut OmpEventNormalizer,
     kind: &str,
+    fields: Value,
+) -> Result<Value> {
+    rpc_command(process, normalizer, kind, fields, COMMAND_TIMEOUT)
+}
+
+fn rpc_command(
+    process: &mut HarnessChild,
+    normalizer: &mut OmpEventNormalizer,
+    kind: &str,
     mut fields: Value,
+    timeout: Duration,
 ) -> Result<Value> {
     let id = format!("centaur-{kind}");
     fields["id"] = json!(id);
     fields["type"] = json!(kind);
     process.stdin.write_all(&command_line(fields)?)?;
     process.stdin.flush()?;
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
