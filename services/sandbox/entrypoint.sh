@@ -346,6 +346,183 @@ path.write_text(json.dumps(_deep_merge(base, overlay), indent=2) + "\n")
 PYEOF
 fi
 
+# ── OMP settings and provider catalog (non-secret overlays only) ─────────────
+# OMP reads agent/config.yml and agent/models.yml, with .yaml fallbacks (and
+# legacy models.json). Keep the same recursive-map merge as Codex/Claude, but
+# fail startup on invalid or credential-bearing input. The persistent .omp
+# link above is intentional; no symlinks below that managed root are followed.
+if [ -n "${OMP_CONFIG_OVERLAY:-}${OMP_MODELS_OVERLAY:-}" ]; then
+    _omp_overlay_root="$HOME_DIR/.omp"
+    if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
+        _omp_overlay_root="$STATE_DIR/omp"
+    fi
+    OMP_OVERLAY_HOME="$HOME_DIR" OMP_OVERLAY_ROOT="$_omp_overlay_root" python3 - <<'PYEOF'
+import contextlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+
+def parse_object(raw):
+    # Bun is already installed for OMP. Use its native YAML parser, just as OMP
+    # does, and emit JSON (valid YAML) without adding another runtime dependency.
+    result = subprocess.run(
+        [
+            "bun", "-e",
+            "process.stdout.write(JSON.stringify(Bun.YAML.parse(await Bun.stdin.text())))",
+        ],
+        input=raw,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode:
+        # Parser diagnostics can contain the supplied value, including secrets.
+        raise ValueError("malformed YAML/JSON")
+    value = json.loads(result.stdout)
+    if not isinstance(value, dict):
+        raise ValueError("expected a YAML/JSON object")
+    return value
+
+
+def reject_credentials(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            words = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).lower()
+            words = re.split(r"[^a-z0-9]+", words)
+            compact = "".join(words)
+            if (
+                set(words) & {
+                    "token", "secret", "secrets", "password", "passwords",
+                    "cookie", "cookies", "auth", "oauth", "authentication",
+                    "authorization", "credential", "credentials",
+                }
+                or compact == "tokens"
+                or "apikey" in compact
+                or any(part in compact for part in ("secret", "password", "cookie"))
+                or compact.endswith(
+                    ("token", "accesstokens", "refreshtokens", "bearertokens", "sessiontokens")
+                )
+            ):
+                raise ValueError("credential/auth keys are not allowed; use iron-proxy")
+            reject_credentials(child)
+    elif isinstance(value, list):
+        for child in value:
+            reject_credentials(child)
+
+
+def deep_merge(base, overlay):
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+name = "OMP_CONFIG_OVERLAY/OMP_MODELS_OVERLAY"
+try:
+    overlays = []
+    for name, filenames in (
+        ("OMP_CONFIG_OVERLAY", ("config.yml", "config.yaml")),
+        ("OMP_MODELS_OVERLAY", ("models.yml", "models.yaml", "models.json")),
+    ):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            overlay = parse_object(raw)
+            reject_credentials(overlay)
+            overlays.append((name, filenames, overlay))
+
+    if overlays:
+        name = overlays[0][0]
+        home = Path(os.environ["OMP_OVERLAY_HOME"])
+        # An overlay must not silently configure a different directory from the
+        # one OMP reads. Relocated roots/profiles are not supported here.
+        agent_dir = str(home / ".omp" / "agent")
+        if (
+            os.environ.get("PI_CONFIG_DIR", ".omp") not in ("", ".omp")
+            or os.environ.get("PI_CODING_AGENT_DIR", agent_dir) not in ("", agent_dir)
+            or os.environ.get("OMP_PROFILE", os.environ.get("PI_PROFILE", "")).strip()
+            not in ("", "default")
+        ):
+            raise ValueError("overlays require the default ~/.omp/agent directory")
+
+        with contextlib.ExitStack() as stack:
+            def open_directory(path, parent=None):
+                try:
+                    os.mkdir(path, mode=0o700, dir_fd=parent)
+                except FileExistsError:
+                    pass
+                fd = os.open(
+                    path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent
+                )
+                stack.callback(os.close, fd)
+                return fd
+
+            root_fd = open_directory(os.environ["OMP_OVERLAY_ROOT"])
+            agent_fd = open_directory("agent", root_fd)
+            plans = []
+            for name, filenames, overlay in overlays:
+                handle = None
+                filename = filenames[0]
+                base = {}
+                for candidate in filenames:
+                    try:
+                        fd = os.open(
+                            candidate,
+                            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                            dir_fd=agent_fd,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    handle = stack.enter_context(os.fdopen(fd, "r+", encoding="utf-8"))
+                    metadata = os.fstat(fd)
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink != 1
+                        or not metadata.st_mode & 0o222
+                    ):
+                        raise ValueError("target must be a writable, singly linked regular file")
+                    existing = handle.read()
+                    base = parse_object(existing) if existing.strip() else {}
+                    filename = candidate
+                    break
+                text = json.dumps(deep_merge(base, overlay), indent=2, allow_nan=False) + "\n"
+                plans.append((name, filename, handle, text))
+
+            # Validate both overlays and their bases before changing either file.
+            for name, filename, handle, text in plans:
+                if handle is None:
+                    fd = os.open(
+                        filename,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=agent_fd,
+                    )
+                    handle = stack.enter_context(os.fdopen(fd, "w", encoding="utf-8"))
+                # Updating the opened inode preserves existing permissions/owner.
+                handle.seek(0)
+                handle.write(text)
+                handle.truncate()
+                handle.flush()
+except OSError as exc:
+    print(
+        f"invalid {name}: unsafe or unwritable OMP target (no symlinks): {exc.strerror}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+except (ValueError, RecursionError) as exc:
+    # Do not include raw JSON decoder errors, which may contain supplied text.
+    message = str(exc) if type(exc) is ValueError else "invalid YAML/JSON structure"
+    print(f"invalid {name}: {message}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+    unset _omp_overlay_root
+fi
+
 # CLAUDE_CODE_AUTH_MODE selects how Claude Code authenticates with the upstream
 # (mirrors CODEX_AUTH_MODE):
 #   - api_key (default): Claude Code uses ANTHROPIC_API_KEY against

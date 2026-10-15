@@ -261,6 +261,10 @@ Sandbox entrypoint and wrappers:
 | Custom provider `apiKeyEnv` | The configured iron-proxy secret source. | Bearer token for that provider. Sandboxes receive only a same-name placeholder, and replacement is restricted to the provider's `baseUrl` DNS host. |
 | `CODEX_MODEL_REASONING_SUMMARY` | `sandbox.extraEnv`. | Sets `model_reasoning_summary` in the Codex config (`auto`, `concise`, `detailed`, `none`). Codex >= 0.139 emits no reasoning summaries unless this is set, so renderers show no thinking trace. |
 | `CODEX_MODEL_REASONING_EFFORT` | `sandbox.extraEnv`. | Overrides the Codex `model_reasoning_effort` (baked into `harness/codex/config.toml`) and Nanocodex's default thinking effort. It is mirrored into Slackbot so the first response footer displays the effective level. One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; an unknown value is ignored (the config default stands). |
+| `CODEX_CONFIG_OVERLAY` | `sandbox.extraEnv`. | TOML object deep-merged over the baked Codex `config.toml` after other Codex patches. Overlay values win; malformed TOML is ignored. |
+| `CLAUDE_SETTINGS_OVERLAY` | `sandbox.extraEnv`. | JSON object deep-merged over Claude Code's `settings.json`. Overlay values win; malformed JSON is ignored. |
+| `OMP_CONFIG_OVERLAY` | `sandbox.extraEnv`. | Non-secret YAML/JSON object deep-merged into OMP's `~/.omp/agent/config.yml` (or existing `config.yaml`). Invalid or credential-bearing input fails startup before readiness. See [OMP overlays](#omp-overlays). |
+| `OMP_MODELS_OVERLAY` | `sandbox.extraEnv`. | Non-secret YAML/JSON object deep-merged into OMP's `~/.omp/agent/models.yml` (or existing `models.yaml` / legacy `models.json`). Provider endpoints and model definitions only, not credentials. See [OMP overlays](#omp-overlays). |
 | `CLAUDE_MODEL`, `CLAUDE_CONTINUE_SESSION_ID` | `sandbox.extraEnv` or runtime resume. | Claude model and resume behavior. |
 | `CENTAUR_PI_MODEL` | `sandbox.extraEnv`. | Pi harness default model (`provider/id`). The chart mirrors it into slackbotv2 so the Slack footer names the model. See [Using the Pi Harness](/extend/pi-harness). |
 | `CENTAUR_OMP_MODEL` | `sandbox.extraEnv`. | OMP harness default model (`provider/modelId`). The chart mirrors it into slackbotv2 so the Slack footer names the model. See [Using the OMP Harness](/extend/omp-harness). |
@@ -269,6 +273,83 @@ Sandbox entrypoint and wrappers:
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
 | `CALL_TIMEOUT_SECONDS` | Sandbox env before running `call`. | Curl watchdog for API tool calls. |
 | `SLACK_CHANNEL`, `SLACK_THREAD_TS` | Sandbox env. | File-upload helper target. |
+
+### OMP overlays
+
+OMP configuration and provider catalogs use the same `sandbox.extraEnv` delivery
+path as the Codex and Claude overlays. The chart serializes these values into
+`SESSION_SANDBOX_EXTRA_ENV`; api-rs copies that list into sandbox environments.
+No separate Secret, passthrough-key registration, or image fork is needed.
+
+```yaml
+sandbox:
+  extraEnv:
+    OMP_CONFIG_OVERLAY: |
+      task:
+        structured: true
+        batch: true
+        maxConcurrency: 4
+      advisor:
+        enabled: true
+        syncBacklog: "1"
+    OMP_MODELS_OVERLAY: |
+      providers:
+        anthropic:
+          baseUrl: https://models.example.com
+```
+
+Unset or whitespace-only overlays are no-ops. Nested objects merge recursively;
+overlay scalars, arrays, and nulls replace the corresponding on-disk value.
+Unmentioned keys remain intact. Both overlays and existing base files must parse
+as YAML/JSON objects before either file is changed. Malformed input, non-object
+roots, credential keys (including token, API key, secret, password, cookie and
+authorization variants), and OMP `auth`/`oauth` sections fail startup without
+printing supplied values. This is a configuration merge, not an OMP schema
+validator: supported settings/models remain the installed OMP version's contract.
+Provider routing text does not grant network access or credentials; use the
+existing iron-proxy secret-injection path, never overlay fields or env dumps.
+
+Overlays support the default `~/.omp/agent` directory, including the sandbox's
+managed persistent-state `.omp` link. Relocation through `PI_CONFIG_DIR`,
+`PI_CODING_AGENT_DIR`, or a non-default `OMP_PROFILE`/`PI_PROFILE` is rejected
+rather than configuring the wrong directory. Symlinked roots other than that
+managed link, symlinked `agent` directories/targets, hard-linked files, and
+read-only files are refused. Existing files are updated through their opened
+inode, retaining permissions and ownership; new directories are `0700` and files
+are `0600`. A read-only configuration pack must not be the writable target.
+
+The file names and precedence above follow OMP **18.11.0**
+([settings loader](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/config/settings.ts#L2367-L2385),
+[models loader](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/config/config-file.ts#L133-L200)):
+`.yml` wins over `.yaml`; OMP can migrate legacy `models.json` when neither YAML
+file exists. The entrypoint merges the same first existing file in place.
+The overlay wins over that global file, not over OMP's later project settings,
+`--config`/`PI_CONFIG_FILES` overlays, runtime overrides, or harness CLI arguments.
+Deployments using another OMP version should check that version's loader.
+
+#### RPC versus CLI defaults
+
+The OMP harness runs `--mode rpc --no-ui`, not the interactive CLI.
+The host-defaulted setting policy sometimes referred to as
+`HOST_DEFAULTED_SETTING_PATHS` is expressed in 18.11.0 as per-setting
+`protocolDefault` declarations applied by
+[`applyProtocolDefaults`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/main.ts#L260-L269);
+that historical constant is not present in this release.
+
+| Settings | RPC neutral defaults when not explicitly configured |
+| --- | --- |
+| [`task` and isolation/worktree settings](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/task/settings.ts) | Isolation disabled; backend `auto`; clone enabled, clean source disabled; worktree start `off`, exit `keep`; apply enabled, merge `patch`, commits `generic`; eager `default`, batch enabled, concurrency `32`, recursion depth `2`; per-agent model/tier/compaction/account/prewalk/advisor settings use their declared defaults. |
+| [`advisor.*`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/advisor/settings.ts), [`tier.advisor`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/session/settings.ts#L621-L628) | Disabled, sync backlog `off`, immune turns `3`, review mode `turn`, interval `1`, notes `4`, stale-result eviction enabled; tier `none`. |
+| [`memories.enabled`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/memories/settings.ts#L10-L15), [`memory.backend`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/memory-backend/settings.ts#L12-L18) | Disabled / `off`. |
+| [`async.*`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/tools/settings.ts#L890-L910), [`bash.autoBackground.*`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/exec/settings.ts), [`eval.autoBackground.*`](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/packages/coding-agent/src/eval/settings.ts#L71-L89) | Async enabled, max jobs `100`; bash auto-background enabled, eval auto-background disabled; both thresholds `60000` ms. |
+
+Set the desired workflow values explicitly in `OMP_CONFIG_OVERLAY`; do not assume
+an interactive host's preferences are implicit RPC defaults. Explicit global,
+project, `--config`, and runtime settings remain authoritative in 18.11.0.
+`task.structured` and `todo.*` are **not** host-defaulted; set structured results
+explicitly if needed. `--no-ui` also makes extension dialogs resolve to defaults;
+configuration does not add an Ask transport. See
+[OMP RPC startup](https://github.com/can1357/oh-my-pi/blob/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4/docs/rpc.md#startup).
 
 ## Workflows
 
