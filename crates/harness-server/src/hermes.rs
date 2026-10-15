@@ -553,7 +553,7 @@ fn run_hermes_turn<W: Write>(
                     break;
                 }
             }
-            if let Some(notification) = normalizer.finish_turn_interrupted()? {
+            for notification in normalizer.finish_turn_interrupted()? {
                 write_value(stdout, &notification_to_wire_value(&notification)?)?;
             }
             return Ok(());
@@ -573,7 +573,7 @@ fn run_hermes_turn<W: Write>(
                 }
                 if terminal {
                     // A failed turn's error was latched from the Result event.
-                    if let Some(notification) = normalizer.finish_turn(None)? {
+                    for notification in normalizer.finish_turn(None)? {
                         write_value(stdout, &notification_to_wire_value(&notification)?)?;
                     }
                     return Ok(());

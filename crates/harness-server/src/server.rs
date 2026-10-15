@@ -1380,7 +1380,7 @@ fn finish_turn_interrupted<W: Write>(
     normalizer: &mut CodexTurnNormalizer,
     stdout: &mut W,
 ) -> Result<()> {
-    if let Some(notification) = normalizer.finish_turn_interrupted()? {
+    for notification in normalizer.finish_turn_interrupted()? {
         if let ServerNotification::TurnCompleted(completed) = &notification {
             state.completed_turns.push(completed.turn.clone());
         }
@@ -1402,7 +1402,7 @@ fn finish_turn_with_error<W: Write>(
     for notification in normalizer.process_event(&normalized)? {
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
-    if let Some(notification) = normalizer.finish_turn(Some(message))? {
+    for notification in normalizer.finish_turn(Some(message))? {
         if let ServerNotification::TurnCompleted(completed) = &notification {
             state.completed_turns.push(completed.turn.clone());
         }
@@ -1614,7 +1614,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
             if harness.turn_hold(event_normalizer) != TurnHold::Released {
                 state.process = None;
             }
-            if let Some(notification) = normalizer.finish_turn(None)? {
+            for notification in normalizer.finish_turn(None)? {
                 if let ServerNotification::TurnCompleted(completed) = &notification {
                     completed_turn = Some(completed.turn.clone());
                 }
@@ -1627,7 +1627,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     if let Some(session_id) = last_session_id {
         state.harness_session_id = Some(session_id);
     }
-    if let Some(notification) = normalizer.finish_turn(None)? {
+    for notification in normalizer.finish_turn(None)? {
         if let ServerNotification::TurnCompleted(completed) = &notification {
             completed_turn = Some(completed.turn.clone());
         }

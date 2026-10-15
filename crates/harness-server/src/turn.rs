@@ -235,9 +235,9 @@ impl CodexTurnNormalizer {
         Ok(out)
     }
 
-    pub fn finish_turn(&mut self, failed: Option<String>) -> Result<Option<ServerNotification>> {
+    pub fn finish_turn(&mut self, failed: Option<String>) -> Result<Vec<ServerNotification>> {
         if self.completed {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let error = failed.or_else(|| self.last_error.clone());
         let status = if error.is_some() {
@@ -248,7 +248,7 @@ impl CodexTurnNormalizer {
         self.finish_turn_with_status(status, error)
     }
 
-    pub fn finish_turn_interrupted(&mut self) -> Result<Option<ServerNotification>> {
+    pub fn finish_turn_interrupted(&mut self) -> Result<Vec<ServerNotification>> {
         self.finish_turn_with_status(TurnStatus::Interrupted, None)
     }
 
@@ -256,13 +256,36 @@ impl CodexTurnNormalizer {
         &mut self,
         status: TurnStatus,
         error: Option<String>,
-    ) -> Result<Option<ServerNotification>> {
+    ) -> Result<Vec<ServerNotification>> {
         if self.completed {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         self.completed = true;
+        let mut out = Vec::with_capacity(self.tool_calls_by_raw_id.len() + 1);
+        // A killed/disconnected harness cannot provide the remaining results.
+        // Close those items before the terminal snapshot, without inventing
+        // output or an exit code, even if the harness claimed turn success.
+        for (_, call) in std::mem::take(&mut self.tool_calls_by_raw_id) {
+            let Some(mut item) = self.started_items.remove(&call.item_id) else {
+                continue;
+            };
+            match &mut item {
+                ThreadItem::CommandExecution { status, .. } => {
+                    *status = CommandExecutionStatus::Failed;
+                }
+                ThreadItem::DynamicToolCall {
+                    status, success, ..
+                } => {
+                    *status = DynamicToolCallStatus::Failed;
+                    *success = Some(false);
+                }
+                _ => unreachable!("tool call must project to a tool item"),
+            }
+            self.completed_items.push(item.clone());
+            out.push(self.item_completed(item));
+        }
         let completed_at = now_secs();
-        Ok(Some(ServerNotification::TurnCompleted(
+        out.push(ServerNotification::TurnCompleted(
             TurnCompletedNotification {
                 thread_id: self.thread_id.clone(),
                 turn: Turn {
@@ -280,7 +303,8 @@ impl CodexTurnNormalizer {
                     duration_ms: Some((completed_at - self.turn_started_at).max(0) * 1000),
                 },
             },
-        )))
+        ));
+        Ok(out)
     }
 
     fn ensure_started(&mut self, out: &mut Vec<ServerNotification>) -> Result<()> {
@@ -755,6 +779,7 @@ mod tests {
     use codex_app_server_protocol::ServerNotification;
     use serde_json::{Value, json};
 
+    use crate::HarnessServer;
     use crate::anthropic::AnthropicStreamEvent;
     use crate::wire::notification_to_jsonrpc;
 
@@ -762,6 +787,72 @@ mod tests {
 
     fn normalizer() -> CodexTurnNormalizer {
         CodexTurnNormalizer::new(BridgeConfig::new("T-local", "turn-1"))
+    }
+
+    #[test]
+    fn recorded_omp_tools_complete_before_interrupted_or_failed_turns() {
+        // omp 18.11.0: abort acknowledges only after the native tool ends.
+        // The interrupt path intentionally consumes those late frames without
+        // publishing them; the turn must still close the already-started tool.
+        for (fixture, tool_id) in [
+            (
+                include_str!("../tests/fixtures/omp/abort_sleep.jsonl"),
+                "call_sleep",
+            ),
+            (
+                include_str!("../tests/fixtures/omp/ask_abort.jsonl"),
+                "call_ask",
+            ),
+        ] {
+            for interrupted in [true, false] {
+                let mut normalizer = normalizer();
+                let mut native = crate::omp::OmpEventNormalizer::default();
+                for line in fixture.lines() {
+                    let recorded: Value = serde_json::from_str(line).unwrap();
+                    let frame: Value =
+                        serde_json::from_str(recorded["line"].as_str().unwrap()).unwrap();
+                    if recorded["stream"] == "stdout" {
+                        let tool_started = frame["type"] == "tool_execution_start";
+                        for event in crate::omp::OmpHarness
+                            .normalize_events(&mut native, frame)
+                            .unwrap()
+                        {
+                            normalizer.process_event(&event).unwrap();
+                        }
+                        if tool_started {
+                            break;
+                        }
+                    }
+                }
+                let events = if interrupted {
+                    normalizer.finish_turn_interrupted()
+                } else {
+                    normalizer.finish_turn(Some("process lost".into()))
+                }
+                .unwrap();
+                assert_eq!(events.len(), 2);
+                let item = notification_to_jsonrpc(&events[0]).unwrap();
+                assert_eq!(item.method, "item/completed");
+                let item = item.params.unwrap()["item"].clone();
+                assert_eq!(item["id"], tool_id);
+                assert_eq!(item["status"], "failed");
+                assert!(item["exitCode"].is_null());
+                assert!(item["aggregatedOutput"].is_null());
+                if tool_id == "call_ask" {
+                    assert_eq!(item["success"], false);
+                    assert!(item["contentItems"].is_null());
+                }
+                let completed = notification_to_jsonrpc(&events[1]).unwrap();
+                assert_eq!(completed.method, "turn/completed");
+                let turn = &completed.params.as_ref().unwrap()["turn"];
+                assert_eq!(
+                    turn["status"],
+                    if interrupted { "interrupted" } else { "failed" }
+                );
+                assert_eq!(turn["items"].as_array().unwrap().last().unwrap(), &item);
+                assert!(normalizer.finish_turn(None).unwrap().is_empty());
+            }
+        }
     }
 
     fn process_anthropic(
@@ -801,7 +892,7 @@ mod tests {
         let completed = notification_to_jsonrpc(&events[1]).unwrap().params.unwrap();
         assert_eq!(completed["item"], started["item"]);
 
-        let turn = normalizer.finish_turn(None).unwrap().unwrap();
+        let turn = normalizer.finish_turn(None).unwrap().pop().unwrap();
         let completed_turn = notification_to_jsonrpc(&turn).unwrap().params.unwrap();
         assert_eq!(completed_turn["turn"]["items"][0], started["item"]);
     }
@@ -949,7 +1040,7 @@ mod tests {
                 }
             }),
         );
-        let done = normalizer.finish_turn(None).unwrap().unwrap();
+        let done = normalizer.finish_turn(None).unwrap().pop().unwrap();
         let rpc = notification_to_jsonrpc(&done).unwrap();
         assert_eq!(rpc.method, "turn/completed");
         let params = rpc.params.unwrap();
