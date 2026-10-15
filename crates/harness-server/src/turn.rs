@@ -205,7 +205,9 @@ impl CodexTurnNormalizer {
                 self.last_error = Some(message.clone());
                 out.push(self.error_notification(message.clone()));
             }
-            NormalizedEvent::Ignored => {}
+            NormalizedEvent::Ignored
+            | NormalizedEvent::UserInputRequest { .. }
+            | NormalizedEvent::UserInputResolved { .. } => {}
         }
 
         Ok(out)

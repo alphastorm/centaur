@@ -4,7 +4,9 @@ use std::process::{Child, ChildStdin, Command as ProcessCommand};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use codex_app_server_protocol::{ThreadStartParams, Turn, UserInput};
+use codex_app_server_protocol::{
+    RequestId, ThreadStartParams, ToolRequestUserInputQuestion, Turn, UserInput,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -34,6 +36,8 @@ pub struct ThreadState {
     pub completed_turns: Vec<Turn>,
     pub process: Option<HarnessChild>,
     pub thread_started_sent: bool,
+    /// Explicit opt-in via thread config `omp.tool_ui`; extensions stay headless.
+    pub omp_tool_ui: bool,
 }
 
 pub struct HarnessChild {
@@ -107,6 +111,22 @@ pub trait HarnessServer {
         Ok(())
     }
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>>;
+    fn event_normalizer(&self, _state: &ThreadState) -> Self::EventNormalizer {
+        Self::EventNormalizer::default()
+    }
+    fn stdin_for_answer(
+        &self,
+        _normalizer: &mut Self::EventNormalizer,
+        _id: &RequestId,
+        _result: Option<Value>,
+    ) -> Result<Vec<u8>> {
+        Err(crate::HarnessServerError::Protocol(
+            "unknown or expired interactive request".into(),
+        ))
+    }
+    fn expire_requests(&self, _normalizer: &mut Self::EventNormalizer) -> Vec<String> {
+        Vec::new()
+    }
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         self.stdin_for_turn(input)
     }
@@ -162,6 +182,8 @@ pub trait HarnessServer {
             completed_turns: Vec::new(),
             process: None,
             thread_started_sent: false,
+            omp_tool_ui: params.config.as_ref().and_then(|c| c.get("omp.tool_ui"))
+                == Some(&Value::Bool(true)),
         }
     }
 }
@@ -180,6 +202,14 @@ pub enum TurnHold {
 
 #[derive(Debug, Clone)]
 pub enum NormalizedEvent {
+    UserInputRequest {
+        request_id: String,
+        tool_call_id: String,
+        questions: Vec<ToolRequestUserInputQuestion>,
+    },
+    UserInputResolved {
+        request_id: String,
+    },
     SessionStarted {
         session_id: Option<String>,
     },

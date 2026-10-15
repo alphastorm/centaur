@@ -54,6 +54,7 @@ while IFS= read -r line; do
         esac
         printf '%s\n' '{"type":"response","command":"prompt","success":true}'
         case "$line" in
+        *'"message":"ask"'*) cat '@DIR@/ask.jsonl' ;;
         *'"message":"slow"'*)
             sleep 60 &
             echo $! > '@DIR@/descendant'
@@ -81,6 +82,18 @@ while IFS= read -r line; do
         sleep 0.05
         printf 'acknowledged\n' > '@DIR@/aborted'
         printf '%s\n' '{"id":"centaur-abort","type":"response","command":"abort","success":true}' ;;
+    extension_ui_response)
+        case "$OMP_TEST_UI" in
+        editor)
+            case "$line" in
+            *'"id":"ui-select"'*) printf '%s\n' '{"type":"extension_ui_request","id":"ui-editor","method":"editor","title":"Custom response","promptStyle":true}' ;;
+            *) printf '%s\n' '{"type":"prompt_result","status":"completed","sessionSettled":true}' ;;
+            esac ;;
+        hold) ;;
+        *) printf '%s\n' '{"type":"prompt_result","status":"completed","sessionSettled":true}' ;;
+        esac ;;
+    steer)
+        cat '@DIR@/steer.jsonl' ;;
     *) printf '{"type":"response","id":"centaur-%s","command":"%s","success":true}\n' "$kind" "$kind" ;;
     esac
 done
@@ -122,6 +135,8 @@ impl Server {
             .env_remove("OMP_TEST_FAULT")
             .env_remove("OMP_TEST_ABORT")
             .env_remove("CENTAUR_OMP_ABORT_TIMEOUT_MS")
+            .env_remove("CENTAUR_OMP_TOOL_UI")
+            .env_remove("OMP_TEST_UI")
             .envs(extra_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -216,6 +231,12 @@ impl Server {
     }
 
     fn close(&mut self) {
+        if let Ok(pid) = std::fs::read_to_string(self.dir.join("descendant"))
+            && let Ok(pid) = pid.trim().parse::<i32>()
+        {
+            // SAFETY: clean up the owned sleeper even on a failed regression.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
@@ -653,6 +674,289 @@ fn cooperative_abort_waits_for_ack_and_preserves_history_without_replay() {
             2
         );
         assert_eq!(std::fs::read_to_string(&history).unwrap(), original);
+    }
+}
+
+fn prepare_ask(server: &Server, requests: &[Value]) {
+    let frames = std::iter::once(json!({
+        "type": "tool_execution_start", "toolCallId": "ask-call", "toolName": "ask", "args": {}
+    }))
+    .chain(requests.iter().cloned());
+    std::fs::write(
+        server.dir.join("ask.jsonl"),
+        frames.map(|frame| format!("{frame}\n")).collect::<String>(),
+    )
+    .unwrap();
+}
+
+fn select_request() -> Value {
+    json!({
+        "type": "extension_ui_request", "id": "ui-select", "method": "select",
+        "title": "Which database?", "options": ["Postgres", "Other"],
+        "optionDetails": [{"description": "Existing database"}, {}]
+    })
+}
+
+fn answer(request: &Value, text: &str) -> Value {
+    let question = request["params"]["questions"][0]["id"].as_str().unwrap();
+    json!({"id": request["id"], "result": {"answers": {question: {"answers": [text]}}}})
+}
+
+#[test]
+fn tool_ui_surfaces_bound_requests_and_applies_answers_once() {
+    let mut server = Server::new(&[("CENTAUR_OMP_TOOL_UI", "true"), ("OMP_TEST_UI", "editor")]);
+    prepare_ask(&server, &[select_request()]);
+    server.user("ask", json!({}));
+    let events = server.read_until("item/tool/requestUserInput");
+    let request = events.last().unwrap();
+    let tool = items(&events, "item/started", "dynamicToolCall")[0];
+    assert_eq!(request["params"]["itemId"], tool["id"]);
+    assert_eq!(
+        request["params"]["threadId"],
+        events[0]["params"]["thread"]["id"]
+    );
+    assert!(
+        request["params"]["turnId"]
+            .as_str()
+            .unwrap()
+            .starts_with("turn-")
+    );
+    assert_eq!(
+        request["params"]["questions"][0]["question"],
+        "Which database?"
+    );
+    assert_eq!(
+        request["params"]["questions"][0]["options"][0]["description"],
+        "Existing database"
+    );
+    assert!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .contains("--mode rpc-ui --no-ui")
+    );
+    let first_answer = answer(request, "Other");
+    server.send(answer(request, "not an offered option"));
+    assert_eq!(
+        server
+            .until(|event| event["id"] == request["id"])
+            .last()
+            .unwrap()["error"]["code"],
+        -32600
+    );
+    server.send(first_answer.clone());
+    let events = server.read_until("item/tool/requestUserInput");
+    assert!(
+        events
+            .iter()
+            .any(|event| event["method"] == "serverRequest/resolved"
+                && event["params"]["requestId"] == request["id"])
+    );
+    let editor = events.last().unwrap();
+    assert!(
+        editor["params"]["questions"][0]["isOther"]
+            .as_bool()
+            .unwrap()
+    );
+    assert!(editor["params"]["questions"][0]["options"].is_null());
+    server.send(first_answer.clone());
+    let rejected = server.until(|event| event["id"] == first_answer["id"]);
+    assert_eq!(rejected.last().unwrap()["error"]["code"], -32600);
+    let malicious = "\"}\n{\"type\":\"bash\",\"command\":\"touch injected\"}\n$(touch injected)";
+    server.send(answer(editor, malicious));
+    assert_eq!(status(&server.read_until("turn/completed")), "completed");
+    let responses: Vec<_> = server
+        .commands()
+        .into_iter()
+        .filter(|c| c["type"] == "extension_ui_response")
+        .collect();
+    assert_eq!(
+        responses,
+        [
+            json!({"type": "extension_ui_response", "id": "ui-select", "value": "Other"}),
+            json!({"type": "extension_ui_response", "id": "ui-editor", "value": malicious}),
+        ]
+    );
+    assert!(!server.dir.join("injected").exists());
+}
+
+#[test]
+fn tool_ui_cancel_and_process_loss_expire_pending_without_replay() {
+    for loss in [false, true] {
+        let mut server = Server::new(&[("CENTAUR_OMP_TOOL_UI", "true")]);
+        prepare_ask(&server, &[select_request()]);
+        server.user("ask", json!({}));
+        let events = server.read_until("item/tool/requestUserInput");
+        let request = events.last().unwrap();
+        if loss {
+            let argv = std::fs::read_to_string(server.dir.join("argv")).unwrap();
+            let pid: i32 = argv.split('|').next().unwrap().parse().unwrap();
+            // SAFETY: this PID is the owned fake OMP fixture.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        } else {
+            server.send(json!({"type": "interrupt"}));
+        }
+        let ended = server.read_until("turn/completed");
+        assert_eq!(status(&ended), if loss { "failed" } else { "interrupted" });
+        assert!(
+            ended
+                .iter()
+                .any(|event| event["method"] == "serverRequest/resolved"
+                    && event["params"]["requestId"] == request["id"])
+        );
+        let response = answer(request, "Postgres");
+        server.send(response.clone());
+        assert_eq!(
+            server.until(|e| e["id"] == response["id"]).last().unwrap()["error"]["code"],
+            -32600
+        );
+        assert!(
+            !server
+                .commands()
+                .iter()
+                .any(|c| c["type"] == "extension_ui_response")
+        );
+        assert_eq!(status(&server.turn("text", json!({}))), "completed");
+        assert_eq!(
+            server
+                .commands()
+                .iter()
+                .filter(|c| c["type"] == "prompt")
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn tool_ui_default_stays_headless_and_ambiguous_binding_fails_closed() {
+    let mut server = Server::new(&[]);
+    prepare_ask(&server, &[select_request(), result()]);
+    let events = server.turn("ask", json!({}));
+    assert_eq!(status(&events), "completed");
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["method"] == "item/tool/requestUserInput")
+    );
+    assert!(
+        std::fs::read_to_string(server.dir.join("argv"))
+            .unwrap()
+            .contains("--mode rpc --no-ui")
+    );
+
+    let mut server = Server::new(&[("CENTAUR_OMP_TOOL_UI", "true")]);
+    prepare_ask(
+        &server,
+        &[
+            json!({"type": "tool_execution_start", "toolCallId": "second-tool", "toolName": "ask", "args": {}}),
+            select_request(),
+        ],
+    );
+    let events = server.turn("ask", json!({}));
+    assert_eq!(status(&events), "failed");
+    assert!(
+        events.last().unwrap()["params"]["turn"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("expired: ambiguous tool-call binding")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e["method"] == "item/tool/requestUserInput")
+    );
+    assert!(
+        !server
+            .commands()
+            .iter()
+            .any(|c| c["type"] == "extension_ui_response")
+    );
+}
+
+#[test]
+fn tool_ui_thread_config_and_native_cancel_reject_stale_answers() {
+    let mut server = Server::mode(&[], "jsonrpc");
+    server.send(
+        json!({"id": 1, "method": "thread/start", "params": {"config": {"omp.tool_ui": true}}}),
+    );
+    let response = server.until(|e| e["id"] == 1);
+    let thread_id = response.last().unwrap()["result"]["thread"]["id"].clone();
+    prepare_ask(
+        &server,
+        &[
+            select_request(),
+            json!({"type": "extension_ui_request", "id": "ui-other", "method": "editor", "title": "$(touch injected)"}),
+        ],
+    );
+    server.send(json!({"id": 2, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": "ask"}]}}));
+    let first = server
+        .read_until("item/tool/requestUserInput")
+        .pop()
+        .unwrap();
+    let second = server
+        .read_until("item/tool/requestUserInput")
+        .pop()
+        .unwrap();
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(
+        second["params"]["questions"][0]["question"],
+        "$(touch injected)"
+    );
+    std::fs::write(server.dir.join("steer.jsonl"),
+        "{\"type\":\"extension_ui_request\",\"id\":\"cancel-id\",\"method\":\"cancel\",\"targetId\":\"ui-select\"}\n").unwrap();
+    server.send(json!({"id": 3, "method": "turn/steer", "params": {
+        "threadId": thread_id, "expectedTurnId": first["params"]["turnId"], "input": [{"type": "text", "text": "cancel"}]
+    }}));
+    let resolved = server.read_until("serverRequest/resolved");
+    assert_eq!(resolved.last().unwrap()["params"]["requestId"], first["id"]);
+    server.send(answer(&first, "Postgres"));
+    assert_eq!(
+        server.until(|e| e["id"] == first["id"]).last().unwrap()["error"]["code"],
+        -32600
+    );
+    server.send(answer(&second, "safe data"));
+    assert_eq!(status(&server.read_until("turn/completed")), "completed");
+    assert!(!server.dir.join("injected").exists());
+}
+
+#[test]
+fn tool_ui_confirm_input_and_client_cancellation_use_native_frames() {
+    for (method, reply, expected) in [
+        ("confirm", Some("Yes"), json!({"confirmed": true})),
+        ("confirm", Some("No"), json!({"confirmed": false})),
+        ("input", Some("free text"), json!({"value": "free text"})),
+        ("editor", None, json!({"cancelled": true})),
+    ] {
+        let mut server = Server::new(&[("CENTAUR_OMP_TOOL_UI", "true")]);
+        prepare_ask(
+            &server,
+            &[json!({
+                "type": "extension_ui_request", "id": "dialog", "method": method,
+                "title": "Question", "message": "Continue?"
+            })],
+        );
+        server.user("ask", json!({}));
+        let request = server
+            .read_until("item/tool/requestUserInput")
+            .pop()
+            .unwrap();
+        let response = match reply {
+            Some(value) => answer(&request, value),
+            None => json!({"id": request["id"], "error": {"code": -32000, "message": "cancelled"}}),
+        };
+        server.send(response);
+        assert_eq!(status(&server.read_until("turn/completed")), "completed");
+        let mut frame = expected;
+        frame["type"] = json!("extension_ui_response");
+        frame["id"] = json!("dialog");
+        assert_eq!(
+            server
+                .commands()
+                .into_iter()
+                .filter(|c| c["type"] == "extension_ui_response")
+                .collect::<Vec<_>>(),
+            [frame]
+        );
     }
 }
 

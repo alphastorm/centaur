@@ -11,6 +11,11 @@
 //! session.abort), then kills the private process group. The grace period is
 //! `CENTAUR_OMP_ABORT_TIMEOUT_MS` (default 2000, maximum 30000). No input is
 //! replayed, and the saved session is never rewritten by harness-server.
+//! Tool dialogs require thread config `omp.tool_ui: true` (blocks sessions use
+//! `CENTAUR_OMP_TOOL_UI=true`). This selects `rpc-ui --no-ui`: tools can ask,
+//! extensions stay headless, and no approval capability is granted. Replies use
+//! Codex `item/tool/requestUserInput` JSON-RPC responses on the same stdin.
+//! Pending requests expire on cancellation, process loss, or turn completion.
 //!
 //! OMP reads provider API keys from the environment, where the sandbox holds
 //! iron-proxy placeholders that the proxy replaces on the wire.
@@ -24,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::{RequestId, UserInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -39,6 +44,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK_BYTES: usize = 256 * 1024;
 
+#[path = "omp_ui.rs"]
+mod ui;
+
 #[derive(Debug, Default)]
 pub struct OmpHarness;
 
@@ -48,6 +56,7 @@ pub struct OmpEventNormalizer {
     waiting_for_settle: bool,
     /// Reasoning items opened by streamed thinking, closed by their message's end.
     streamed_reasoning: Vec<String>,
+    tool_ui: Option<ui::ToolUi>,
 }
 
 impl HarnessServer for OmpHarness {
@@ -67,10 +76,14 @@ impl HarnessServer for OmpHarness {
         "omp"
     }
 
-    fn command_for_turn(&self, _state: &ThreadState) -> ProcessCommand {
+    fn command_for_turn(&self, state: &ThreadState) -> ProcessCommand {
         let bin = env::var("CENTAUR_OMP_BIN").unwrap_or_else(|_| "omp".to_string());
         let mut command = ProcessCommand::new(bin);
-        command.args(["--mode", "rpc", "--no-ui"]);
+        command.args([
+            "--mode",
+            if state.omp_tool_ui { "rpc-ui" } else { "rpc" },
+            "--no-ui",
+        ]);
         // harness-server reports this turn's telemetry; OMP would otherwise
         // export its own duplicate spans to the sandbox's OTLP endpoint.
         command.env("OTEL_SDK_DISABLED", "true");
@@ -168,6 +181,31 @@ impl HarnessServer for OmpHarness {
     fn stdin_for_turn(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         prompt_command("prompt", input)
     }
+    fn event_normalizer(&self, state: &ThreadState) -> OmpEventNormalizer {
+        OmpEventNormalizer {
+            tool_ui: state.omp_tool_ui.then(ui::ToolUi::default),
+            ..Default::default()
+        }
+    }
+    fn stdin_for_answer(
+        &self,
+        normalizer: &mut OmpEventNormalizer,
+        id: &RequestId,
+        result: Option<Value>,
+    ) -> Result<Vec<u8>> {
+        normalizer
+            .tool_ui
+            .as_mut()
+            .ok_or_else(|| protocol_error("tool UI is disabled"))?
+            .answer(id, result)
+    }
+    fn expire_requests(&self, normalizer: &mut OmpEventNormalizer) -> Vec<String> {
+        normalizer
+            .tool_ui
+            .as_mut()
+            .map(ui::ToolUi::expire)
+            .unwrap_or_default()
+    }
     fn stdin_for_steer(&self, input: &[UserInput]) -> Result<Vec<u8>> {
         prompt_command("steer", input)
     }
@@ -254,6 +292,21 @@ impl OmpEventNormalizer {
         let Some(event) = self.frame(event)? else {
             return Ok(Vec::new());
         };
+        let mut expired = Vec::new();
+        if let Some(ui) = self.tool_ui.as_mut() {
+            match event["type"].as_str() {
+                Some("extension_ui_request") => return ui.request(event),
+                Some("tool_execution_start") => {
+                    if let Some(id) = event["toolCallId"].as_str().filter(|id| !id.is_empty()) {
+                        ui.tool_started(id);
+                    }
+                }
+                Some("tool_execution_end") => {
+                    expired = ui.tool_ended(event["toolCallId"].as_str().unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
         Ok(match event["type"].as_str() {
             Some("response") => self.response(&event),
             Some("message_update")
@@ -284,12 +337,13 @@ impl OmpEventNormalizer {
                 }],
             }],
             Some("tool_execution_end") => {
-                vec![NormalizedEvent::ToolResults(vec![NormalizedToolResult {
+                expired.push(NormalizedEvent::ToolResults(vec![NormalizedToolResult {
                     exit_code: event["result"]["details"]["exitCode"]
                         .as_i64()
                         .and_then(|code| i32::try_from(code).ok()),
                     ..tool_result(&event)
-                }])]
+                }]));
+                expired
             }
             Some("prompt_result") => {
                 self.waiting_for_settle = event["sessionSettled"] == false;

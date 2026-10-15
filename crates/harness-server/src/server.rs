@@ -16,9 +16,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use codex_app_server_protocol::{
     ApprovalsReviewer, AskForApproval, ClientResponse, InitializeResponse, JSONRPCError,
     JSONRPCErrorError, JSONRPCMessage, JSONRPCRequest, JSONRPCResponse, RequestId, SandboxPolicy,
-    ServerNotification, ThreadResumeParams, ThreadResumeResponse, ThreadStartParams,
-    ThreadStartResponse, TurnInterruptParams, TurnInterruptResponse, TurnStartParams,
-    TurnStartResponse, TurnStatus, TurnSteerParams, TurnSteerResponse, UserInput,
+    ServerNotification, ServerRequest, ServerRequestResolvedNotification, ThreadResumeParams,
+    ThreadResumeResponse, ThreadStartParams, ThreadStartResponse, ToolRequestUserInputParams,
+    TurnInterruptParams, TurnInterruptResponse, TurnStartParams, TurnStartResponse, TurnStatus,
+    TurnSteerParams, TurnSteerResponse, UserInput,
 };
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
@@ -38,7 +39,7 @@ use crate::traits::{
     NormalizedEvent, ThreadState, TurnHold,
 };
 use crate::turn::{BridgeConfig, CodexTurnNormalizer};
-use crate::util::{absolute_path, default_codex_home, write_value};
+use crate::util::{absolute_path, default_codex_home, stable_id, write_value};
 use crate::wire::{is_known_untyped_server_notification, notification_to_wire_value};
 use crate::{HarnessServerError, Result};
 
@@ -108,6 +109,12 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     continue;
                 }
 
+                if let Some(answer) = parse_answer(trimmed) {
+                    if request_tx.send(answer).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 match parse_blocks_line_with_state(trimmed, &mut blocks_state) {
                     Ok(BlocksCommand::Interrupt) if turn_active.load(Ordering::SeqCst) => {
                         if request_tx.send(ActiveTurnRequest::BlocksInterrupt).is_err() {
@@ -144,7 +151,13 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
         });
     }
 
-    while let Ok(input) = command_rx.recv() {
+    loop {
+        drain_active_turn_requests(&request_rx, &mut stdout)?;
+        let input = match command_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(input) => input,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match input {
             BlocksReaderInput::Command(BlocksCommand::User {
                 input,
@@ -177,7 +190,7 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                     &request_rx,
                     &turn_active,
                 );
-                drain_active_turn_requests(&request_rx);
+                drain_active_turn_requests(&request_rx, &mut stdout)?;
                 if let Err(error) = result {
                     eprintln!("blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, &state.id, "turn", error.to_string())?;
@@ -216,13 +229,19 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
                     continue;
                 }
             };
-            let JSONRPCMessage::Request(request) = message else {
-                continue;
+            let request = match message {
+                JSONRPCMessage::Request(request) => ActiveTurnRequest::JsonRpc(request),
+                JSONRPCMessage::Response(response) => ActiveTurnRequest::Answer {
+                    id: response.id,
+                    result: Some(response.result),
+                },
+                JSONRPCMessage::Error(error) => ActiveTurnRequest::Answer {
+                    id: error.id,
+                    result: None,
+                },
+                _ => continue,
             };
-            if request_tx
-                .send(ActiveTurnRequest::JsonRpc(request))
-                .is_err()
-            {
+            if request_tx.send(request).is_err() {
                 break;
             }
         }
@@ -243,6 +262,14 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
             ActiveTurnRequest::BlocksInterrupt => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
+            ActiveTurnRequest::Answer { id, .. } => {
+                write_error(
+                    &mut stdout,
+                    id,
+                    -32600,
+                    "unknown or expired interactive request".into(),
+                )?;
+            }
         }
     }
 
@@ -251,7 +278,12 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
 
 fn initial_blocks_thread_state<H: HarnessServer>(harness: &H) -> Result<ThreadState> {
     let cwd = env::current_dir()?;
-    let params = ThreadStartParams::default();
+    let mut params = ThreadStartParams::default();
+    if harness.kind() == HarnessKind::Omp
+        && env::var("CENTAUR_OMP_TOOL_UI").as_deref() == Ok("true")
+    {
+        params.config = Some(HashMap::from([("omp.tool_ui".into(), Value::Bool(true))]));
+    }
     Ok(harness.thread_state(&params, cwd))
 }
 
@@ -291,10 +323,41 @@ enum BlocksReaderInput {
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
     BlocksInterrupt,
+    Answer {
+        id: RequestId,
+        result: Option<Value>,
+    },
 }
 
-fn drain_active_turn_requests(rx: &Receiver<ActiveTurnRequest>) {
-    while rx.try_recv().is_ok() {}
+fn parse_answer(line: &str) -> Option<ActiveTurnRequest> {
+    match serde_json::from_str::<JSONRPCMessage>(line).ok()? {
+        JSONRPCMessage::Response(response) => Some(ActiveTurnRequest::Answer {
+            id: response.id,
+            result: Some(response.result),
+        }),
+        JSONRPCMessage::Error(error) => Some(ActiveTurnRequest::Answer {
+            id: error.id,
+            result: None,
+        }),
+        _ => None,
+    }
+}
+
+fn drain_active_turn_requests<W: Write>(
+    rx: &Receiver<ActiveTurnRequest>,
+    stdout: &mut W,
+) -> Result<()> {
+    while let Ok(request) = rx.try_recv() {
+        if let ActiveTurnRequest::Answer { id, .. } = request {
+            write_error(
+                stdout,
+                id,
+                -32600,
+                "unknown or expired interactive request".into(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1079,10 +1142,19 @@ fn resumed_thread_state<H: HarnessServer>(
         completed_turns: Vec::new(),
         process: None,
         thread_started_sent: false,
+        omp_tool_ui: params.config.as_ref().and_then(|c| c.get("omp.tool_ui"))
+            == Some(&Value::Bool(true)),
     })
 }
 
 fn apply_resume_overrides(state: &mut ThreadState, params: &ThreadResumeParams) -> Result<()> {
+    if let Some(value) = params.config.as_ref().and_then(|c| c.get("omp.tool_ui")) {
+        let enabled = value == &Value::Bool(true);
+        if enabled != state.omp_tool_ui {
+            state.process = None;
+            state.omp_tool_ui = enabled;
+        }
+    }
     if let Some(model) = &params.model {
         state.model = model.clone();
     }
@@ -1107,9 +1179,37 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     harness: &H,
     process: &mut HarnessChild,
     normalizer: &mut CodexTurnNormalizer,
+    event_normalizer: &mut H::EventNormalizer,
     request: ActiveTurnRequest,
     stdout: &mut W,
 ) -> Result<bool> {
+    if let ActiveTurnRequest::Answer { id, result } = request {
+        if let Some(status) = process.child.try_wait()? {
+            write_error(
+                stdout,
+                id,
+                -32600,
+                "unknown or expired interactive request".into(),
+            )?;
+            return Err(HarnessServerError::HarnessExited {
+                kind: harness.kind(),
+                status,
+                stderr: String::new(),
+            });
+        }
+        match harness.stdin_for_answer(event_normalizer, &id, result) {
+            Ok(bytes) => {
+                let sent = process
+                    .stdin
+                    .write_all(&bytes)
+                    .and_then(|()| process.stdin.flush());
+                write_request_resolved(stdout, normalizer.thread_id(), id)?;
+                sent?;
+            }
+            Err(error) => write_error(stdout, id, -32600, error.to_string())?,
+        }
+        return Ok(false);
+    }
     let ActiveTurnRequest::JsonRpc(request) = request else {
         harness.interrupt_process(process)?;
         return Ok(true);
@@ -1235,7 +1335,8 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         normalizer.turn_id(),
         usage_span_input_value(input),
     );
-    match run_harness_turn(
+    let mut event_normalizer = harness.event_normalizer(state);
+    let result = run_harness_turn(
         harness,
         state,
         input,
@@ -1243,7 +1344,15 @@ fn run_normalized_turn<H: HarnessServer, W: Write>(
         stdout,
         request_rx,
         &mut telemetry,
-    ) {
+        &mut event_normalizer,
+    );
+    expire_requests(
+        harness,
+        &mut event_normalizer,
+        normalizer.thread_id(),
+        stdout,
+    )?;
+    match result {
         Ok(Some(turn)) => {
             telemetry.finish(TelemetryTurnStatus::Completed);
             state.completed_turns.push(turn);
@@ -1302,6 +1411,7 @@ fn finish_turn_with_error<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_harness_turn<H: HarnessServer, W: Write>(
     harness: &H,
     state: &mut ThreadState,
@@ -1310,6 +1420,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     stdout: &mut W,
     request_rx: &Receiver<ActiveTurnRequest>,
     telemetry: &mut TurnTelemetry,
+    event_normalizer: &mut H::EventNormalizer,
 ) -> Result<Option<codex_app_server_protocol::Turn>> {
     ensure_harness_process(harness, state)?;
     {
@@ -1343,7 +1454,6 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
     // has not started; any output pushes it back.
     let mut hold_deadline: Option<Instant> = None;
     let mut last_session_id = state.harness_session_id.clone();
-    let mut event_normalizer = H::EventNormalizer::default();
     let mut completed_turn = None;
     loop {
         while let Ok(request) = request_rx.try_recv() {
@@ -1351,7 +1461,14 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                 .process
                 .as_mut()
                 .ok_or(HarnessServerError::HarnessStdinUnavailable)?;
-            if handle_active_turn_request(harness, process, normalizer, request, stdout)? {
+            if handle_active_turn_request(
+                harness,
+                process,
+                normalizer,
+                event_normalizer,
+                request,
+                stdout,
+            )? {
                 state.process = None;
                 return Err(HarnessServerError::TurnInterrupted {
                     kind: harness.kind(),
@@ -1379,9 +1496,37 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     continue;
                 }
                 let event = harness.parse_stdout_line(trimmed)?;
-                let normalized_events = harness.normalize_events(&mut event_normalizer, event)?;
+                let normalized_events = harness.normalize_events(event_normalizer, event)?;
                 let mut terminal_stop = false;
                 for normalized in normalized_events {
+                    match normalized {
+                        NormalizedEvent::UserInputRequest {
+                            request_id,
+                            tool_call_id,
+                            questions,
+                        } => {
+                            let request = ServerRequest::ToolRequestUserInput {
+                                request_id: RequestId::String(request_id),
+                                params: ToolRequestUserInputParams {
+                                    thread_id: normalizer.thread_id().into(),
+                                    turn_id: normalizer.turn_id().into(),
+                                    item_id: stable_id(&tool_call_id, "tool-call"),
+                                    questions,
+                                },
+                            };
+                            write_value(stdout, &serde_json::to_value(request)?)?;
+                            continue;
+                        }
+                        NormalizedEvent::UserInputResolved { request_id } => {
+                            write_request_resolved(
+                                stdout,
+                                normalizer.thread_id(),
+                                RequestId::String(request_id),
+                            )?;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     telemetry.observe_normalized(&normalized);
                     if let Some(session_id) = normalized.session_id() {
                         last_session_id = Some(session_id.to_string());
@@ -1405,7 +1550,7 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                         _ => {}
                     }
                 }
-                hold_deadline = match harness.turn_hold(&event_normalizer) {
+                hold_deadline = match harness.turn_hold(event_normalizer) {
                     TurnHold::Idle(window) => Some(Instant::now() + window),
                     TurnHold::Released | TurnHold::Waiting => None,
                 };
@@ -1417,10 +1562,28 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
                     kind: harness.kind(),
                 });
             }
-            Err(RecvTimeoutError::Timeout) => match settle_deadline {
-                Some(deadline) if Instant::now() >= deadline => terminal = true,
-                _ => continue,
-            },
+            Err(RecvTimeoutError::Timeout) => {
+                // A tool may still hold stdout after the OMP leader vanishes.
+                // Its in-memory dialogs cannot be answered or resumed.
+                if harness.kind() == HarnessKind::Omp
+                    && let Some(status) = state
+                        .process
+                        .as_mut()
+                        .ok_or(HarnessServerError::HarnessStdoutUnavailable)?
+                        .child
+                        .try_wait()?
+                {
+                    return Err(HarnessServerError::HarnessExited {
+                        kind: harness.kind(),
+                        status,
+                        stderr: String::new(),
+                    });
+                }
+                match settle_deadline {
+                    Some(deadline) if Instant::now() >= deadline => terminal = true,
+                    _ => continue,
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => {
                 let status = state
                     .process
@@ -1444,10 +1607,11 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
             }
         }
         if terminal {
+            expire_requests(harness, event_normalizer, normalizer.thread_id(), stdout)?;
             // Background work outliving the turn (e.g. an error result while
             // agents run) would deliver its output into the next turn; stop
             // it with the process, which the next turn resumes.
-            if harness.turn_hold(&event_normalizer) != TurnHold::Released {
+            if harness.turn_hold(event_normalizer) != TurnHold::Released {
                 state.process = None;
             }
             if let Some(notification) = normalizer.finish_turn(None)? {
@@ -1470,6 +1634,31 @@ fn run_harness_turn<H: HarnessServer, W: Write>(
         write_value(stdout, &notification_to_wire_value(&notification)?)?;
     }
     Ok(completed_turn)
+}
+
+fn write_request_resolved<W: Write>(
+    stdout: &mut W,
+    thread_id: &str,
+    request_id: RequestId,
+) -> Result<()> {
+    let notification =
+        ServerNotification::ServerRequestResolved(ServerRequestResolvedNotification {
+            thread_id: thread_id.into(),
+            request_id,
+        });
+    write_value(stdout, &notification_to_wire_value(&notification)?)
+}
+
+fn expire_requests<H: HarnessServer, W: Write>(
+    harness: &H,
+    event_normalizer: &mut H::EventNormalizer,
+    thread_id: &str,
+    stdout: &mut W,
+) -> Result<()> {
+    for id in harness.expire_requests(event_normalizer) {
+        write_request_resolved(stdout, thread_id, RequestId::String(id))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn usage_span_input_value(input: &[UserInput]) -> Option<String> {
