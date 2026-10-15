@@ -20,7 +20,7 @@ use axum::{
     routing::{any, get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use centaur_session_core::{ChatDestination, ThreadKey};
+use centaur_session_core::{ChatDestination, ThreadKey, UserInputAnswers};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, SandboxRuntime, SessionPrincipalRegistrar,
     SessionRuntime,
@@ -221,6 +221,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/api/session/{thread_key}/interrupt",
             post(interrupt_session_execution),
+        )
+        .route(
+            "/api/session/{thread_key}/executions/{execution_id}/user-input",
+            get(list_user_input_requests),
+        )
+        .route(
+            "/api/session/{thread_key}/executions/{execution_id}/user-input/{request_id}",
+            post(respond_to_user_input_request),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
         .route(
@@ -472,15 +480,18 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
         (&Method::GET, "/api/session/{thread_key}")
-        | (&Method::GET, "/api/session/{thread_key}/events") => {
+        | (&Method::GET, "/api/session/{thread_key}/events")
+        | (&Method::GET, "/api/session/{thread_key}/executions/{execution_id}/user-input") => {
             capability(Capability::SessionsRead)
         }
         (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
-        | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
-            capability(Capability::SessionsWrite)
-        }
+        | (&Method::POST, "/api/session/{thread_key}/interrupt")
+        | (
+            &Method::POST,
+            "/api/session/{thread_key}/executions/{execution_id}/user-input/{request_id}",
+        ) => capability(Capability::SessionsWrite),
         (&Method::POST, "/api/sandboxes/drain")
         | (&Method::POST, "/api/session/{thread_key}/pause") => {
             capability(Capability::SandboxesDrain)
@@ -765,6 +776,60 @@ async fn interrupt_session_execution(
         execution_id: outcome.execution_id,
         thread_key,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserInputResponseRequest {
+    answers: Option<UserInputAnswers>,
+    #[serde(default)]
+    cancel: bool,
+}
+
+async fn list_user_input_requests(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path((raw_thread_key, execution_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
+    let requests = runtime
+        .user_input_requests(&thread_key, &execution_id)
+        .await?;
+    Ok(Json(json!({ "requests": requests })))
+}
+
+async fn respond_to_user_input_request(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path((raw_thread_key, execution_id, request_id)): Path<(String, String, String)>,
+    Json(request): Json<UserInputResponseRequest>,
+) -> Result<StatusCode, ApiError> {
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let runtime = state.runtime()?;
+    // Bind the execution to the authorized path before attempting any write.
+    runtime
+        .user_input_requests(&thread_key, &execution_id)
+        .await?;
+    match (request.answers, request.cancel) {
+        (Some(answers), false) => {
+            runtime
+                .answer_user_input_request(&execution_id, &request_id, answers, caller.identity())
+                .await?
+        }
+        (None, true) => {
+            runtime
+                .cancel_user_input_request(&execution_id, &request_id, caller.identity())
+                .await?
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "provide answers or cancel: true, exclusively".to_owned(),
+            ));
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Default, serde::Deserialize)]

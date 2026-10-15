@@ -944,6 +944,150 @@ mod tests {
         assert!(body.get("linear").is_none());
     }
 
+    #[tokio::test]
+    async fn user_input_routes_require_session_capabilities_and_platform_scope() {
+        for suffix in ["", "/request-1"] {
+            let method = if suffix.is_empty() {
+                Method::GET
+            } else {
+                Method::POST
+            };
+            for (thread, token, expected) in [
+                ("slack%3AC1%3A1.0", "", StatusCode::UNAUTHORIZED),
+                (
+                    "discord%3AC1%3A1.0",
+                    "test-slackbot-key",
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    "slack%3AC1%3A1.0",
+                    "test-slackbot-key",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            ] {
+                let response =
+                    build_router_with_app_state(AppState::unready(test_auth_with_slack()))
+                        .oneshot(
+                            Request::builder()
+                                .method(method.clone())
+                                .uri(format!(
+                                    "/api/session/{thread}/executions/ex-1/user-input{suffix}"
+                                ))
+                                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(Body::from(r#"{"cancel":true}"#))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                assert_eq!(response.status(), expected);
+            }
+            let response = build_router_with_app_state(AppState::unready(test_auth()))
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!(
+                            "/api/session/slack%3AC1%3A1.0/executions/ex-1/user-input{suffix}"
+                        ))
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", principal_token("prn_test")),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"cancel":true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_input_routes_read_status_and_reject_foreign_or_stale_execution() {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            return;
+        };
+        let store = PgSessionStore::connect(&url).await.unwrap();
+        store
+            .run_migrations(centaur_session_sqlx::TextSearchBackend::Postgres)
+            .await
+            .unwrap();
+        let thread = centaur_session_core::ThreadKey::parse(format!(
+            "api:input-{}",
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ))
+        .unwrap();
+        store
+            .create_or_get_session(
+                &thread,
+                &centaur_session_core::HarnessType::Codex,
+                None,
+                json!({}),
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        let execution = store
+            .create_execution(&thread, None, json!({}))
+            .await
+            .unwrap()
+            .execution;
+        let app = build_router_with_runtime(
+            store.clone(),
+            SandboxRuntime::backend(Arc::new(TestBackend::default()), SandboxSpec::new("test")),
+        );
+        let path = format!(
+            "/api/session/{}/executions/{}/user-input",
+            thread.as_str(),
+            execution.execution_id
+        );
+        for (method, uri, expected) in [
+            (Method::GET, path.clone(), StatusCode::OK),
+            (
+                Method::POST,
+                format!("{path}/request-1"),
+                StatusCode::CONFLICT,
+            ),
+            (
+                Method::GET,
+                path.replace(thread.as_str(), "api:foreign"),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                path.replace(&execution.execution_id, "missing"),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header(header::AUTHORIZATION, format!("Bearer {}", console_token()))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"cancel":true}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&body).unwrap(),
+                    json!({"requests":[]})
+                );
+            }
+        }
+        store
+            .complete_execution(&execution.execution_id)
+            .await
+            .unwrap();
+    }
+
     #[derive(Default)]
     struct TestBackend {
         next_id: AtomicU64,

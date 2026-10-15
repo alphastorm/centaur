@@ -61,6 +61,12 @@ impl IntoResponse for ApiError {
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::NotFound { .. })) => {
                 StatusCode::NOT_FOUND
             }
+            Self::Runtime(SessionRuntimeError::Store(
+                SessionStoreError::ExecutionNotFound { .. } | SessionStoreError::UserInputNotFound,
+            )) => StatusCode::NOT_FOUND,
+            Self::Runtime(SessionRuntimeError::Store(SessionStoreError::UserInputConflict)) => {
+                StatusCode::CONFLICT
+            }
             Self::Runtime(SessionRuntimeError::Store(SessionStoreError::HarnessConflict {
                 ..
             })) => StatusCode::CONFLICT,

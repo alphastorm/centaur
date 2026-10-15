@@ -40,6 +40,82 @@ pod replacement, or worker failover does not erase the run. The event stream is
 the client contract; Slack and other clients should reconnect with
 `after_event_id` instead of trying to reconstruct state locally.
 
+### Answer a harness question
+
+When a harness emits the Codex App Server `item/tool/requestUserInput` request,
+the API persists its execution, thread, turn, item, request ID, and questions.
+The existing events endpoint emits `session.user_input_requested`. Its SSE
+`id` is the durable event ID and its JSON `data` is:
+
+```json
+{
+  "execution_id": "exec_example",
+  "request_id": "request_example",
+  "thread_id": "thread_example",
+  "turn_id": "turn_example",
+  "item_id": "item_example",
+  "questions": [{
+    "id": "choice",
+    "header": "Approach",
+    "question": "Which approach should be used?",
+    "isOther": true,
+    "isSecret": false,
+    "options": [{"label": "First", "description": "Use the first approach"}]
+  }]
+}
+```
+
+Use `POST /api/session/{thread_key}/executions/{execution_id}/user-input/{request_id}`
+with either an answer for every question or a decline:
+
+```json
+{"answers":{"choice":{"answers":["First"]}}}
+```
+
+```json
+{"cancel":true}
+```
+
+URL-encode each path segment. Request IDs are strings in the API; numeric
+JSON-RPC IDs retain their original numeric type on the harness pipe.
+Success returns **204**, an unknown request/execution or an execution outside
+the path's session returns **404**, and an already consumed, foreign-execution,
+expired, or unavailable-original-pipe request returns **409**. Invalid answer
+keys or supplying both answers and cancellation returns **400**.
+Authentication, session-write capability, and ingress platform scoping match
+the interrupt endpoint. The audit actor is the authenticated caller; ingresses
+must separately authorize the end user before calling this service API.
+
+This operation sends one JSON-RPC response directly to the original live pipe,
+not a new user turn. A decline sends an error with code `-32000` and message
+`User declined`. Only a SHA-256 answer digest and the caller identity are stored,
+never the raw answer. Known token patterns in questions are redacted as in
+ordinary output.
+
+`GET /api/session/{thread_key}/executions/{execution_id}/user-input` returns
+`{"requests":[...]}` for session-read callers, with each request's
+`execution_id`, `request_id`, `thread_id`, `turn_id`, `item_id`, `questions`,
+`status`, `reason`, `created_at`, and `resolved_at`. Render only `pending`
+requests; retained terminal rows explain why old controls no longer work.
+
+Every state change emits replayable `session.user_input_resolved` data:
+`{"execution_id":"exec_example","request_id":"request_example","status":"answered","reason":null}`.
+Terminal statuses are `answered`, `cancelled` (`user_declined`), `resolved`
+(`server_resolved`), `expired` (`execution_completed`, `execution_cancelled`,
+`execution_failed`, or `pipe_lost`), and `delivery_failed`
+(`response_write_failed`). `serverRequest/resolved`, execution completion,
+cancellation, failure, and losing/replacing an attach pipe close pending
+requests. Reattaching conservatively expires old questions even if the sandbox
+process may have survived; answers are never replayed into a replacement pipe.
+
+Delivery is **at most once**, not atomic across PostgreSQL and process stdin:
+the request is consumed durably before the write, so concurrent or repeated
+answers are rejected. A failed write changes its status to `delivery_failed`;
+a crash after consumption can leave `answered` or `cancelled` without confirmed
+delivery. In either case a fresh harness request is required, not a retry of
+the old answer. Resolution events report consumption, not a harness
+acknowledgement, and a later `delivery_failed` event supersedes it.
+
 ## Slackbot ingress
 
 Slack talks to Centaur through the Slack Events API. The public request URL is
