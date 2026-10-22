@@ -249,7 +249,7 @@ describe('Slack home team API metadata', () => {
 })
 
 describe('session event streaming', () => {
-  test('passes activity summary events through to the renderer source stream', async () => {
+  test('passes activity summary and steering events through to the renderer source stream', async () => {
     const encoded = new TextEncoder().encode(
       [
         'id: 1',
@@ -257,6 +257,10 @@ describe('session event streaming', () => {
         'data: {"summary":"The agent is reading App Server events."}',
         '',
         'id: 2',
+        'event: session.steering_delivered',
+        'data: {"execution_id":"exec-1","input_line_count":1}',
+        '',
+        'id: 3',
         'event: session.execution_completed',
         'data: {"result_text":"done"}',
         '',
@@ -289,12 +293,18 @@ describe('session event streaming', () => {
       eventId: 1,
       eventKind: 'session.activity_summary'
     })
-    expect(events[1]).toMatchObject({
-      event: 'session.execution_completed',
+    expect(events[1]).toEqual({
+      data: { execution_id: 'exec-1', input_line_count: 1 },
+      event: 'session.steering_delivered',
       eventId: 2,
+      eventKind: 'session.steering_delivered'
+    })
+    expect(events[2]).toMatchObject({
+      event: 'session.execution_completed',
+      eventId: 3,
       eventKind: 'session.execution_completed'
     })
-    expect(seenEventIds).toEqual([1, 2])
+    expect(seenEventIds).toEqual([1, 2, 3])
   })
 
   test('uses interrupted wording for cancelled executions without error text', async () => {
@@ -780,68 +790,6 @@ describe('forwardToSessionApi overrides', () => {
 })
 
 describe('forwardToSessionApi harness restart', () => {
-  test('records a Slack-owned harness assignment on session creation and execution', async () => {
-    const { fetchFn, requests } = fakeApi({
-      createSession: [
-        {
-          body: {
-            harness_switched: false,
-            harness_type: 'nanocodex'
-          },
-          status: 200
-        }
-      ]
-    })
-    const harnessAssignment = {
-      experiment: 'codex_nanocodex_ab',
-      requestedHarness: 'codex',
-      cohort: 'nanocodex',
-      rolloutPercent: 50
-    }
-    let resolvedHarness: string | undefined
-    let resolvedExperiment: string | undefined
-
-    await forwardToSessionApi(
-      options(fetchFn),
-      forwardInput(apiMessage('hi'), {
-        harnessAssignment,
-        harnessType: 'nanocodex',
-        restartOnHarnessConflict: false
-      }),
-      {
-        onSessionCreated: async outcome => {
-          resolvedHarness = outcome.harnessType
-          resolvedExperiment = outcome.harnessAssignment?.experiment
-        }
-      }
-    )
-
-    expect(resolvedHarness).toBe('nanocodex')
-    expect(resolvedExperiment).toBe('codex_nanocodex_ab')
-    const create = requests.find(request => request.url.endsWith('.000100'))
-    expect(create?.body).toMatchObject({
-      harness_type: 'nanocodex',
-      metadata: {
-        harness_assignment: {
-          experiment: 'codex_nanocodex_ab',
-          requested_harness: 'codex',
-          cohort: 'nanocodex',
-          rollout_percent: 50
-        }
-      }
-    })
-    expect('on_harness_conflict' in (create?.body as object)).toBe(false)
-    expect(executeBody(requests).metadata).toMatchObject({
-      harness_type: 'nanocodex',
-      harness_assignment: {
-        experiment: 'codex_nanocodex_ab',
-        requested_harness: 'codex',
-        cohort: 'nanocodex',
-        rollout_percent: 50
-      }
-    })
-  })
-
   test('harness_switched response fires onSessionRestarted and prepends the preamble', async () => {
     const { fetchFn, requests } = fakeApi({
       createSession: [{ body: { ok: true, harness_switched: true }, status: 200 }]

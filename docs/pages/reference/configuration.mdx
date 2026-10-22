@@ -19,6 +19,7 @@ Use these as the main extension points:
 | `apiRs.nodeSelector`, `apiRs.affinity`, `apiRs.tolerations` | Controls scheduling for api-rs pods, including dedicated tainted node pools. |
 | `console.nodeSelector`, `console.affinity`, `console.tolerations` | Controls scheduling for Console web pods, including dedicated tainted node pools. |
 | `console.worker.nodeSelector`, `console.worker.affinity`, `console.worker.tolerations` | Controls scheduling for Console background worker pods independently from the web pods. |
+| `tokenBroker.*` | token-broker, which refreshes Console broker credentials: `enabled` (default `false`; set its image first), replicas, poll interval, concurrency, scheduling, and metrics. |
 | `postgres.nodeSelector`, `postgres.affinity`, `postgres.tolerations` | Controls scheduling for the bundled PostgreSQL pod. Ensure selected nodes can mount its persistent storage. |
 | `postgres.enabled`, `externalDatabase.*` | Replaces the bundled PostgreSQL with an external server such as RDS or Cloud SQL, scopes NetworkPolicy egress to it, and selects the company-context text-search backend. See [Use an External PostgreSQL](/deploying-in-production#use-an-external-postgresql). |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
@@ -64,7 +65,7 @@ for the operator workflow.
 
 | Env var or value | Set from | Controls |
 | --- | --- | --- |
-| `IRON_CONTROL_DATABASE_URL` | `secretManager.existingSecretName`. | Console database connection. Keep it separate from the api-rs logical database. |
+| `IRON_CONTROL_DATABASE_URL` | `secretManager.existingSecretName`. | Console database connection. Required by api-rs, which reads principals and their effective config through it in read-only sessions. Keep it separate from the api-rs logical database. |
 | `IRON_CONTROL_INITIAL_USER_EMAIL`, `IRON_CONTROL_INITIAL_USER_PASSWORD` | `secretManager.existingSecretName`; local bootstrap generates defaults when absent. | Creates the initial Console admin when no user exists. |
 | `IRON_CONTROL_INITIAL_API_KEY` | `secretManager.existingSecretName`; local bootstrap generates it when absent. | Admin API key used by api-rs and `centaur-perms`. |
 | `IRON_CONTROL_AR_ENCRYPTION_PRIMARY_KEY`, `IRON_CONTROL_AR_ENCRYPTION_DETERMINISTIC_KEY`, `IRON_CONTROL_AR_ENCRYPTION_KEY_DERIVATION_SALT` | `secretManager.existingSecretName`; local bootstrap generates them when absent. | Encrypts credential material at rest. Keep these stable after first boot. |
@@ -120,7 +121,7 @@ created. Changing a default does not rewrite existing principals.
 | `apiRs.activitySummary.*` | Helm values, default disabled. | Enables API-RS to summarize live session activity into durable `session.activity_summary` events. |
 | `SLACK_BOT_TOKEN` | Explicit `secretKeyRef` from `secretManager.existingSecretName`. | Slack Web API access for api-rs Slack proxy and workflow Slack helpers. |
 | `OPENAI_API_KEY` | Secret mounted into api-rs, or `apiRs.extraEnv` for local/dev overrides. | OpenAI credential for activity summaries; the feature stays disabled when no key is present. |
-| `OPENAI_BASE_URL` | `apiRs.extraEnv`; default `https://api.openai.com/v1`. | OpenAI-compatible Responses API base URL for every api-rs OpenAI caller: Codex, generated session titles, and activity summaries. API-RS passes it into Codex sandboxes and derives iron-proxy's `OPENAI_API_KEY` host scope from it. |
+| `OPENAI_BASE_URL` | `apiRs.extraEnv`; default `https://api.openai.com/v1`. | OpenAI-compatible Responses API base URL for every api-rs OpenAI caller: Codex, generated session titles, and activity summaries. API-RS passes it into Codex sandboxes and derives iron-proxy's `OPENAI_API_KEY` host scope from it; `api.openai.com` and `us.api.openai.com` are always included. |
 | `SESSION_ACTIVITY_SUMMARY_OPENAI_BASE_URL` | Deprecated `apiRs.activitySummary.openaiBaseUrl` compatibility setting. | Existing activity-summary endpoint override. `OPENAI_BASE_URL` takes precedence when both are set. |
 | `SESSION_ACTIVITY_SUMMARY_MODEL` | `apiRs.activitySummary.model`, default `gpt-5.4-nano`. | Model used for the short live activity sentence. |
 
@@ -172,14 +173,12 @@ Execution tuning:
 | `LINEAR_API_KEY` | Secret or `slackbot.extraEnv`. | Enables Slack feedback commands to create Linear issues. |
 | `SLACK_FEEDBACK_COMMANDS`, `SLACK_FEEDBACK_ALLOWED_CHANNELS` | `slackbot.extraEnv`. | Feedback slash commands and optional channel allowlist. |
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
-| `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
-| `SLACKBOTV2_AGENT_VIEW_ENABLED` | `slackbotv2.agentViewEnabled`. | Enables Slack agent view, threaded DM sessions, and native status and titles. Defaults to `false`. Requires the Slack app migration described in [Quickstart](/quickstart). Native Stop support is deferred. |
+| `SLACKBOTV2_AGENT_VIEW_ENABLED` | `slackbotv2.agentViewEnabled`. | Enables Slack agent view, threaded DM sessions, and native status and titles. Defaults to `false`. Requires the Slack app migration described in [Quickstart](/quickstart). Subscribe to `agent_session_stopped` for the native Stop button. |
 | `SLACKBOTV2_AUTO_JOIN_CREATED_CHANNELS` | `slackbotv2.autoJoinCreatedChannels`. | Joins newly-created public channels after subscribed `channel_created` events. Requires `channels:read` and `channels:join`. Defaults to `false`. |
 | `SLACKBOTV2_STEERING_REACTION_ENABLED` | `slackbotv2.steeringReactionEnabled`. | Reacts to mentioned follow-up messages while an execution is active, then removes their reactions after the assistant response is posted. Requires `reactions:write`. Defaults to `false` and disables itself for the running process if Slack reports the scope is missing. |
 | `SLACKBOTV2_STEERING_REACTION` | `slackbotv2.steeringReaction`. | Slack emoji name used for steering acknowledgements. Defaults to `hourglass_flowing_sand`. |
 | `SLACKBOTV2_DEFAULT_HARNESS` | `sandbox.harnessEngine`. | Base harness for new Slack threads without an explicit flag or channel default. |
 | `SLACKBOTV2_ENABLED_HARNESSES` | Unrestricted when unset. | Comma-separated harness wire values allowed by Slack routing, set through `slackbotv2.extraEnv`. Disabled message overrides, channel defaults, and sticky threads fall back to the enabled deployment default. |
-| `SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT` | `slackbotv2.codexNanocodexRolloutPercent`. | Percentage of otherwise-default Codex Slack threads assigned to Nanocodex. Assignment is deterministic by thread key and recorded in session and execution metadata. Selecting a non-default model bypasses the rollout. When response metadata is enabled, Slack shows the resolved harness name. Defaults to `0`; increase it to enroll new Codex Slack threads. |
 | `SLACKBOTV2_CHANNEL_DEFAULTS` | `slackbotv2.channelDefaults`. | Per-channel default persona / harness / model / provider / reasoning as a JSON object keyed by Slack conversation id, where each value is an object of optional `persona`/`harness`/`model`/`provider`/`reasoning` fields (same vocabulary as the inline flags, so `harness: claude`, `provider: bedrock`, and Claude model aliases like `opus` all work), e.g. `{"C0ENG":{"harness":"claude","model":"opus","reasoning":"high"},"C0TRIAGE":{"reasoning":"low"}}`. A model is only meaningful within a harness, so name the harness alongside it. Applied when a message in that channel carries no explicit/sticky per-thread flag (below such a flag, above the deployment/baked default) and forwarded onto the harness input line so it takes effect; setting the harness restarts a thread onto it like a `--claude`/`--codex` flag. `reasoning` affects the Codex, Nanocodex, Claude Code, and Pi harnesses. `persona` names a deployed persona and, like `--persona`, applies only when the thread's session is created. Malformed JSON and unrecognized field values are logged and ignored. |
 | `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
@@ -349,7 +348,7 @@ From the repository root, run:
 
 ```sh
 psql -X --set ON_ERROR_STOP=1 \
-  --file services/api-rs/crates/centaur-session-sqlx/manual-migrations/session_events_retention_index.sql
+  --file crates/centaur-session-sqlx/manual-migrations/session_events_retention_index.sql
 ```
 
 The script creates a partial index concurrently. Run it outside a transaction;

@@ -14,7 +14,6 @@ class Principal < ApplicationRecord
   has_many :principal_roles, dependent: :destroy
   has_many :roles, through: :principal_roles
   has_many :slack_channel_permissions, dependent: :destroy
-  has_many :sync_config_snapshots, class_name: "PrincipalSyncConfigSnapshot", dependent: :destroy
   has_many :mcp_oauth_authorization_codes, dependent: :destroy
   has_many :mcp_oauth_refresh_tokens, dependent: :destroy
   belongs_to :created_by, class_name: "User"
@@ -85,6 +84,19 @@ class Principal < ApplicationRecord
       .reject(&:blank?)
       .uniq
       .sort
+  end
+
+  # Every kind of secret this principal resolves to, keyed by secret kind.
+  def granted_secrets_by_kind
+    {
+      "static" => granted_static_secrets,
+      "gcp_auth" => granted_gcp_auth_secrets,
+      "gcp_id_token" => granted_gcp_id_token_secrets,
+      "aws_auth" => granted_aws_auth_secrets,
+      "oauth_token" => granted_oauth_token_secrets,
+      "pg_dsn" => granted_pg_dsn_secrets,
+      "hmac" => granted_hmac_secrets
+    }
   end
 
   # Static secrets this principal resolves to, via its effective grants.
@@ -234,12 +246,6 @@ class Principal < ApplicationRecord
     scope.update_all("sync_config_cache_version = sync_config_cache_version + 1")
   end
 
-  def self.enqueue_sync_config_snapshot_warm(ids)
-    Array(ids).compact.uniq.each do |id|
-      PrincipalSyncConfigSnapshotWarmJob.perform_later(id)
-    end
-  end
-
   def self.effective_grantees_for_grantable(grantable)
     association = grantable.model_name.singular.to_sym
     grants = Grant.where(association => grantable)
@@ -371,9 +377,9 @@ class Principal < ApplicationRecord
   # in ASCENDING priority: the highest-priority grant lands last and becomes
   # authoritative. A secret reachable by several grants (e.g. both directly and
   # via a role) collapses to one row taking the strongest priority among them
-  # (MAX), and the id tiebreak keeps the order deterministic for config_hash.
+  # (MAX), and the id tiebreak keeps the order deterministic.
   # The selected effective_priority also drives cross-type conflict resolution
-  # when PrincipalSyncConfigSnapshot assembles a payload.
+  # when PrincipalSyncConfig assembles a payload.
   #
   # Do NOT add an `.order(:id)`-style sort to the per-type callers above or emit
   # grants in any other order downstream: that would silently let the wrong

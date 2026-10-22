@@ -7,8 +7,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use codex_app_server_protocol::{JSONRPCMessage, ServerNotification};
-use harness_server::is_known_untyped_server_notification;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -1274,6 +1272,7 @@ fn turn_interrupt_rejects_wrong_thread_and_turn_without_killing_process() {
 
     let interrupted = bridge.run_turn_with_rejected_interrupts(
         &thread_id,
+        &start_log,
         3,
         4,
         5,
@@ -1884,9 +1883,12 @@ impl BridgeProcess {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Interrupts only after the harness has written `started_marker`, so a
+    /// slow spawn cannot be killed before it records its start.
     fn run_turn_with_rejected_interrupts(
         &mut self,
         thread_id: &str,
+        started_marker: &Path,
         request_id: i64,
         wrong_thread_interrupt_request_id: i64,
         wrong_turn_interrupt_request_id: i64,
@@ -1974,6 +1976,14 @@ impl BridgeProcess {
                     && !wrong_thread_interrupt_sent
                     && !capture.turn_id.is_empty()
                 {
+                    while !started_marker.exists() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "harness never wrote {}",
+                            started_marker.display()
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                     self.send(json!({
                         "id": wrong_thread_interrupt_request_id,
                         "method": "turn/interrupt",
@@ -2507,27 +2517,24 @@ impl RawProcess {
     }
 }
 
+/// Checks the JSON-RPC envelope of a line of app-server stdout. Payload shapes
+/// are checked against the Codex types in `crates/harness-server-conformance`.
 fn validate_jsonrpc_value(value: &Value, allow_error: bool) {
-    let message: JSONRPCMessage =
-        serde_json::from_value(value.clone()).expect("valid JSON-RPC message");
-    match message {
-        JSONRPCMessage::Notification(notification) => {
-            let method = notification.method.clone();
-            if !is_known_untyped_server_notification(&method) {
-                ServerNotification::try_from(notification).unwrap_or_else(|error| {
-                    panic!(
-                        "notification is not a typed Codex App Server V2 notification: {error}; value={value}"
-                    )
-                });
-            }
-        }
-        JSONRPCMessage::Response(_) => {}
-        JSONRPCMessage::Error(error) => {
-            assert!(allow_error, "app-server returned JSON-RPC error: {error:?}");
-        }
-        JSONRPCMessage::Request(request) => {
-            panic!("app-server emitted unexpected request: {request:?}")
-        }
+    let has_id = value.get("id").is_some();
+    if value.get("method").is_some() {
+        assert!(!has_id, "app-server emitted unexpected request: {value}");
+        assert!(
+            value.get("params").is_some_and(Value::is_object),
+            "notification without params: {value}"
+        );
+    } else if let Some(error) = value.get("error") {
+        assert!(has_id, "JSON-RPC error without id: {value}");
+        assert!(allow_error, "app-server returned JSON-RPC error: {error}");
+    } else {
+        assert!(
+            has_id && value.get("result").is_some(),
+            "not a JSON-RPC message: {value}"
+        );
     }
 }
 

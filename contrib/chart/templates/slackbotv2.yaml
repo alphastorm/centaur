@@ -46,8 +46,6 @@ spec:
             # --nanocodex flag run the deployment's default harness.
             - name: SLACKBOTV2_DEFAULT_HARNESS
               value: {{ .Values.sandbox.harnessEngine | quote }}
-            - name: SLACKBOTV2_CODEX_NANOCODEX_ROLLOUT_PERCENT
-              value: {{ .Values.slackbotv2.codexNanocodexRolloutPercent | quote }}
             - name: SLACK_BOT_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -104,10 +102,6 @@ spec:
             - name: SLACKBOTV2_ASSISTANT_STATUS
               value: {{ .Values.slackbotv2.assistantStatus | quote }}
 {{- end }}
-{{- if .Values.slackbotv2.externalOrgAllowlist }}
-            - name: SLACKBOT_EXTERNAL_ORG_ALLOWLIST
-              value: {{ .Values.slackbotv2.externalOrgAllowlist | quote }}
-{{- end }}
 {{- if .Values.slackbotv2.triggerBotAllowlist }}
             - name: SLACKBOT_TRIGGER_BOT_ALLOWLIST
               value: {{ .Values.slackbotv2.triggerBotAllowlist | quote }}
@@ -146,6 +140,15 @@ spec:
           ports:
             - containerPort: 3001
               name: http
+          # /health fails until the state database connects; keep liveness
+          # from restarting the pod while Postgres is still starting.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            periodSeconds: 5
+            failureThreshold: 24
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /health

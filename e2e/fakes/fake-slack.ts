@@ -7,8 +7,9 @@
 // stock Bun image.
 //
 // Test control, on the same port: POST /_e2e/actions clicks a block element
-// the way Slack's interactivity delivery would, and GET /_e2e/ephemeral reads
-// the ephemeral messages a user was shown.
+// the way Slack's interactivity delivery would, GET /_e2e/ephemeral reads
+// the ephemeral messages a user was shown, and GET /_e2e/status reads a
+// thread's assistant status.
 import { createHmac } from 'node:crypto'
 import { BOT, CHANNELS, TEAM, USERS, type SlackUser } from './slack-fixture'
 
@@ -29,6 +30,11 @@ type Message = {
 
 type Ephemeral = { channel: string; user: string; text: string; thread_ts?: string }
 
+// Where Slack's native streaming is unavailable, as in a DM, the Chat SDK posts
+// this placeholder and edits the reply into it. Until that edit the reply is
+// still streaming, though Slack itself does not mark it.
+const CHAT_SDK_STREAM_PLACEHOLDER = '...'
+
 const port = Number(process.env.PORT ?? 443)
 const botToken = requiredEnv('SLACK_BOT_TOKEN')
 const signingSecret = requiredEnv('SLACK_SIGNING_SECRET')
@@ -36,6 +42,8 @@ const eventsUrl = requiredEnv('SLACK_EVENTS_URL')
 
 const messages: Message[] = []
 const ephemerals: Ephemeral[] = []
+/** Assistant status by `channel:thread_ts`; Slack hides it once a message lands in the thread. */
+const statuses = new Map<string, string>()
 let lastTs = 0
 // Slack retries an event three times (immediately, then after 1 and 5
 // minutes); these delays are compressed to fit a turn's timeout.
@@ -52,6 +60,10 @@ Bun.serve({
     if (url.pathname === '/_e2e/ephemeral') {
       const user = url.searchParams.get('user')
       return Response.json(ephemerals.filter(ephemeral => ephemeral.user === user))
+    }
+    if (url.pathname === '/_e2e/status') {
+      const key = `${url.searchParams.get('channel')}:${url.searchParams.get('thread_ts')}`
+      return Response.json({ status: statuses.get(key) ?? '' })
     }
     const method = url.pathname.match(/^\/api\/([\w.]+)$/)?.[1]
     if (!method) return new Response('not found', { status: 404 })
@@ -115,11 +127,12 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
     case 'chat.postMessage':
     case 'chat.startStream': {
       if (!conversation(channel)) return { ok: false, error: 'channel_not_found' }
+      const text = str(body.markdown_text) || str(body.text) || chunksText(body.chunks)
       const message = post(actor, channel, {
-        text: str(body.markdown_text) || str(body.text) || chunksText(body.chunks),
+        text,
         thread_ts: str(body.thread_ts) || undefined,
         blocks: Array.isArray(body.blocks) ? body.blocks : undefined,
-        streaming: method === 'chat.startStream'
+        streaming: method === 'chat.startStream' || (actor === 'bot' && text === CHAT_SDK_STREAM_PLACEHOLDER)
       })
       if (actor !== 'bot') void deliverMessage(message, actor)
       return { ok: true, channel, ts: message.ts, message }
@@ -136,6 +149,7 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
       if (!message) return { ok: false, error: 'message_not_found' }
       const text = str(body.markdown_text) || str(body.text) || chunksText(body.chunks)
       if (method === 'chat.update') {
+        if (message.text === CHAT_SDK_STREAM_PLACEHOLDER) message.streaming = false
         message.text = text
       } else {
         message.text += text
@@ -175,8 +189,11 @@ function handle(method: string, actor: Actor, body: Record<string, unknown>) {
         ? { ok: true, type: 'message', channel, message: withReplies(message) }
         : { ok: false, error: 'message_not_found' }
     }
+    case 'assistant.threads.setStatus':
+      statuses.set(`${str(body.channel_id)}:${str(body.thread_ts)}`, str(body.status))
+      return { ok: true }
     default:
-      // Status and title calls are cosmetic for this stand-in.
+      // Title calls are cosmetic for this stand-in.
       log('fake_slack_unmodeled_method', { method })
       return { ok: true }
   }
@@ -196,6 +213,7 @@ function post(
     ...fields
   }
   messages.push(message)
+  statuses.delete(`${channel}:${message.thread_ts ?? message.ts}`)
   return message
 }
 

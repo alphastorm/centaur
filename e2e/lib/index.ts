@@ -26,8 +26,11 @@ export type Channel = { id: string; name: string }
 /** A provider error, as Anthropic's HTTP error or OpenAI's failed response carries it. */
 export type ProviderError = { status: number; type: string; code?: string; message: string }
 
-/** A scripted model answer, matched by a token placed in the user's message. */
-export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError }
+/**
+ * A scripted model answer, matched by a token placed in the user's message.
+ * `run` first has the harness run a shell command through its shell tool.
+ */
+export type Script = { token: string; text: string; delayMs?: number; error?: ProviderError; run?: string }
 
 export type Execution = { execution_id: string; status: string; error: string | null }
 
@@ -87,6 +90,9 @@ const db = new SQL(required('E2E_DATABASE_URL'))
 const ironControlDb = new SQL(required('E2E_IRON_CONTROL_DATABASE_URL'))
 const apiUrl = required('E2E_API_URL')
 const apiKey = required('E2E_API_KEY')
+const consoleUrl = required('E2E_CONSOLE_URL')
+const consoleApiKey = required('E2E_CONSOLE_API_KEY')
+const logDir = required('E2E_LOG_DIR')
 const namespace = 'centaur'
 const release = 'centaur'
 
@@ -114,6 +120,22 @@ export const model = {
   says(text: string, options: { delayMs?: number } = {}): Script {
     return { token: `e2e-${randomUUID().slice(0, 8)}`, text, ...options }
   },
+  /**
+   * Scripts the model to run a shell command through the harness's shell tool
+   * (OpenAI harnesses), then answer with `text` once the command finishes.
+   */
+  runs(command: string, text = 'Ran it.'): Script {
+    return { token: `e2e-${randomUUID().slice(0, 8)}`, text, run: command }
+  },
+  /**
+   * The X-E2E-Credential header of each request a command made to
+   * https://<provider host>/_e2e/echo/<match>, oldest first.
+   */
+  async echoes(match: string): Promise<Array<string | undefined>> {
+    const response = await fetch(`${modelUrl}/_e2e/echoes?match=${encodeURIComponent(match)}`)
+    const echoes = (await response.json()) as Array<{ credential?: string }>
+    return echoes.map(echo => echo.credential)
+  },
   /** Scripts the provider to fail the request instead of answering it. */
   fails(error: ProviderError): Script {
     return { token: `e2e-${randomUUID().slice(0, 8)}`, text: '', error }
@@ -128,29 +150,38 @@ export const model = {
   }
 }
 
-export const api = {
-  /** Calls api-rs as an operator (the e2e admin key); returns the status and JSON body. */
-  async request(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
-    const response = await fetch(`${apiUrl}${path}`, {
-      method,
-      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) })
-    })
-    const text = await response.text()
-    let payload: unknown = text
-    try {
-      payload = text ? JSON.parse(text) : undefined
-    } catch {
-      // Rejections from request extractors are plain text.
+/** A JSON API called with an operator's bearer key. */
+function operatorApi(baseUrl: string, key: string) {
+  const client = {
+    /** Calls the API; returns the status and JSON body. */
+    async request(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
+      const response = await fetch(`${baseUrl}${path}`, {
+        method,
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      })
+      const text = await response.text()
+      let payload: unknown = text
+      try {
+        payload = text ? JSON.parse(text) : undefined
+      } catch {
+        // Rejections from request extractors are plain text.
+      }
+      return { status: response.status, body: payload }
+    },
+    /** Like request, but fails unless the API answers 2xx. */
+    async ok(method: string, path: string, body?: unknown): Promise<any> {
+      const { status, body: payload } = await client.request(method, path, body)
+      if (status < 200 || status > 299) throw new Error(`${method} ${path} failed: ${status} ${JSON.stringify(payload)}`)
+      return payload
     }
-    return { status: response.status, body: payload }
-  },
-  /** Like request, but fails unless api-rs answers 2xx. */
-  async ok(method: string, path: string, body?: unknown): Promise<any> {
-    const { status, body: payload } = await api.request(method, path, body)
-    if (status < 200 || status > 299) throw new Error(`${method} ${path} failed: ${status} ${JSON.stringify(payload)}`)
-    return payload
-  },
+  }
+  return client
+}
+
+/** api-rs, called as an operator with the e2e admin key. */
+export const api = {
+  ...operatorApi(apiUrl, apiKey),
   /** Pauses the thread's sandbox now, as its idle timeout would; returns whether it paused. */
   async pause(thread: Thread): Promise<boolean> {
     const result = await api.ok('POST', `/api/session/${encodeURIComponent(thread.key)}/pause`)
@@ -172,8 +203,27 @@ export const cluster = {
   },
   /** Restarts a release component and waits for the new pods to be ready. */
   async restart(component: string): Promise<void> {
+    // The new pods replace the old ones and their logs; keep them for failures earlier in the run.
+    const logs = await kubectl({}, 'logs', `deploy/${release}-centaur-${component}`, '--tail=-1')
+      .catch(error => String(error))
+    await Bun.write(`${logDir}/${component}-before-restart-${Date.now()}.log`, logs)
     await kubectl({}, 'rollout', 'restart', `deploy/${release}-centaur-${component}`)
     await kubectl({}, 'rollout', 'status', `deploy/${release}-centaur-${component}`, '--timeout=180s')
+  },
+  /** What a sandbox's iron-proxy reports applying from proxy-sync, from its management API. */
+  async proxyStatus(sandboxId: string): Promise<{ config_hash: string; principal_id: string; last_sync_at: string }> {
+    const pod = await kubectl(
+      {},
+      'get', 'pods', '-l', `centaur.ai/iron-proxy=true,centaur.ai/sandbox-id=${sandboxId}`,
+      '-o', 'jsonpath={.items[0].metadata.name}'
+    )
+    if (!pod) throw new Error(`sandbox ${sandboxId} has no iron-proxy pod`)
+    const status = await kubectl(
+      {},
+      'exec', pod, '-c', 'iron-proxy', '--', 'sh', '-c',
+      'curl -fsS -H "Authorization: Bearer $IRON_MANAGEMENT_API_KEY" "http://127.0.0.1:${IRON_MANAGEMENT_LISTEN##*:}/v1/status"'
+    )
+    return JSON.parse(status)
   },
   /** Kubernetes objects api-rs created for a sandbox and has not removed. */
   async sandboxResources(sandboxId: string): Promise<string[]> {
@@ -278,6 +328,8 @@ export type Principal = {
  * sandbox proxy's credentials and grants.
  */
 export const ironControl = {
+  /** The console API, called as an operator with the key api-rs administers it with. */
+  api: operatorApi(consoleUrl, consoleApiKey),
   /** The principals a sandbox's proxy acts for: the conversation, and the requester if one is bound. */
   async proxy(sandboxId: string): Promise<{ principal: Principal; requester: Principal | null }> {
     const [proxy] = await ironControlDb`
@@ -358,6 +410,13 @@ export class Thread {
     await eventually(`the model request of ${this.key}'s latest turn`, turnTimeoutMs, async () =>
       (await modelRequests(token)).length > 0 ? true : undefined
     )
+  }
+
+  /** The assistant status Slack shows on the thread now; empty when none is shown. */
+  async status(): Promise<string> {
+    const query = new URLSearchParams({ channel: this.channel.id, thread_ts: this.ts })
+    const { status } = (await (await fetch(`${slackUrl}/_e2e/status?${query}`)).json()) as { status: string }
+    return status
   }
 
   private async send(text: string, script: Script | undefined, as: SlackUser = USER): Promise<string> {
@@ -466,7 +525,9 @@ async function registerScript(script: Script): Promise<void> {
   const response = await fetch(`${modelUrl}/_e2e/replies`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ match: script.token, text: script.text, delayMs: script.delayMs, error: script.error })
+    body: JSON.stringify({
+      match: script.token, text: script.text, delayMs: script.delayMs, error: script.error, run: script.run
+    })
   })
   if (!response.ok) throw new Error(`registering the model script failed: ${response.status}`)
 }
