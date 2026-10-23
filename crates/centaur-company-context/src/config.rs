@@ -105,7 +105,8 @@ pub struct Config {
     )]
     pub slack_oauth_app_slug: String,
     /// Schedules Google Drive sync. Disabling it pauses ingestion and keeps
-    /// indexed documents searchable.
+    /// indexed documents searchable; readiness then no longer requires a
+    /// Google Drive credential.
     #[arg(
         long,
         env = "COMPANY_CONTEXT_DRIVE_ENABLED",

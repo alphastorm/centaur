@@ -60,6 +60,9 @@ const SLACK_BOT_CONVERSATION_TYPES: [&str; 2] = ["public_channel", "private_chan
 pub struct ConsoleCredentials {
     pool: PgPool,
     encryption: Arc<ActiveRecordEncryption>,
+    /// Whether Drive sync is scheduled; readiness requires a Drive credential
+    /// only then.
+    drive_enabled: bool,
     google_oauth_app_slug: String,
     granola_oauth_app_slug: String,
     slack_oauth_app_slug: String,
@@ -139,6 +142,7 @@ impl ConsoleCredentials {
                 &config.active_record_primary_key,
                 &config.active_record_key_derivation_salt,
             )),
+            drive_enabled: config.drive_enabled,
             google_oauth_app_slug: config.google_oauth_app_slug.clone(),
             granola_oauth_app_slug: config.granola_oauth_app_slug.clone(),
             slack_oauth_app_slug: config.slack_oauth_app_slug.clone(),
@@ -616,6 +620,12 @@ impl ConsoleCredentials {
     }
 
     pub async fn ready(&self) -> bool {
+        if !self.drive_enabled {
+            return sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(&self.pool)
+                .await
+                .is_ok();
+        }
         let Ok(ids) = self.google_credential_ids(GoogleProduct::Drive).await else {
             return false;
         };
@@ -680,6 +690,7 @@ mod tests {
         ConsoleCredentials {
             pool: pool.clone(),
             encryption: Arc::new(ActiveRecordEncryption::new("primary", "salt")),
+            drive_enabled: true,
             google_oauth_app_slug: "google".to_owned(),
             granola_oauth_app_slug: "granola".to_owned(),
             slack_oauth_app_slug: "slack".to_owned(),
@@ -851,6 +862,63 @@ mod tests {
         );
 
         server.abort();
+        database.drop().await;
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_a_drive_credential_only_while_drive_syncs() {
+        let Ok(database_url) = env::var("COMPANY_CONTEXT_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set COMPANY_CONTEXT_TEST_DATABASE_URL to a ParadeDB Postgres URL");
+            return;
+        };
+        let database = TestDatabase::create(&database_url, "readiness").await;
+        let pool = &database.pool;
+        pool.execute(
+            r#"
+            CREATE TABLE oauth_apps (
+                id bigint PRIMARY KEY, provider text NOT NULL, slug text NOT NULL,
+                enabled boolean NOT NULL DEFAULT true
+            );
+            CREATE TABLE broker_credentials (
+                id bigint PRIMARY KEY, oauth_app_id bigint, provider_subject text,
+                provider_email text, access_token text, expires_at timestamp,
+                scopes jsonb NOT NULL, dead boolean NOT NULL DEFAULT false,
+                updated_at timestamp NOT NULL DEFAULT now()
+            );
+            INSERT INTO oauth_apps VALUES (1, 'google', 'google');
+            "#,
+        )
+        .await
+        .unwrap();
+        let mut credentials = test_credentials(pool, "http://127.0.0.1:9");
+
+        // Without a Google credential, only a deployment that does not sync
+        // Drive is ready.
+        assert!(!credentials.ready().await);
+        credentials.drive_enabled = false;
+        assert!(credentials.ready().await);
+
+        // A live Drive credential makes a deployment that syncs Drive ready.
+        let access_token = credentials.encryption.encrypt("token").unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO broker_credentials (id, oauth_app_id, access_token, scopes)
+            VALUES (1, 1, $1, $2)
+            "#,
+        )
+        .bind(access_token)
+        .bind(Json([GoogleProduct::Drive.scope()]))
+        .execute(pool)
+        .await
+        .unwrap();
+        credentials.drive_enabled = true;
+        assert!(credentials.ready().await);
+
+        // Without Drive, readiness still requires the Console database.
+        credentials.drive_enabled = false;
+        credentials.close().await;
+        assert!(!credentials.ready().await);
+
         database.drop().await;
     }
 }
